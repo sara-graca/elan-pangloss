@@ -457,6 +457,17 @@ def _tier_lang(tid, tier_map):
         return ""
     return t.get("LANG_REF") or t.get("DEFAULT_LOCALE") or ""
 
+def _guess_lang(tid, tier_map):
+    """Tier LANG_REF/DEFAULT_LOCALE first, else 'en'/'fr' if the name contains it."""
+    lang = _tier_lang(tid, tier_map)
+    if lang:
+        return lang
+    low = (tid or "").lower()
+    if "en" in low:
+        return "en"
+    if "fr" in low:
+        return "fr"
+    return ""
 
 def _run_flow(build_steps, state):
     """
@@ -669,8 +680,9 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
             tier_ids, allow_back=True
         )
         langs = {}
+        langs = {}
         for ttid in s["transl"]:
-            langs[ttid] = _ask_lang_required(ttid, _tier_lang(ttid, tier_map))
+            langs[ttid] = _ask_lang_required(ttid, _guess_lang(ttid, tier_map))
         s["transl_langs"] = langs
 
     def step_notes(state):
@@ -1422,6 +1434,9 @@ def write_xml(segments, cfg, out_path):
 
     lines.append(f"</{root_tag}>")
 
+    out_path = Path(out_path)
+    if out_path.parent and not out_path.parent.exists():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
 
