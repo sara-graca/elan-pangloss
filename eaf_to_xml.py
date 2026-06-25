@@ -1696,7 +1696,7 @@ def process_directory(eaf_dir, output_dir, config=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert ELAN .eaf to Pangloss/Cocoon XML.",
+        description="Convert ELAN .eaf to Pangloss XML.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
