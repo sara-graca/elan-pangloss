@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 eaf_to_xml.py — Convert ELAN .eaf files to the Pangloss XML format.
 
@@ -692,14 +691,14 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
             "Transcription tier  [XML: <FORM>]",
             tier_ids, required=True, default=tx_default, allow_back=True
         )
-        kind = _ask("  Transcription type (e.g. phono, ortho)  "
+        kind = _ask("  Transcription type (e.g. phono, ortho, or Enter for none)  "
                     "[XML: <FORM kindOf='...'>]", "", allow_back=True)
         forms = [{"tier": s["sentence"], "kind": kind or None}]
         while _yesno("Add another transcription line?", False, allow_back=True):
             ft = _pick_one("  Transcription tier  [XML: <FORM>]", tier_ids, allow_back=True)
             if not ft:
                 break
-            fk = _ask("  Transcription type (e.g. phono, ortho)  "
+            fk = _ask("  Transcription type (e.g. phono, ortho, or Enter for none)  "
                       "[XML: <FORM kindOf='...'>]", "", allow_back=True)
             forms.append({"tier": ft, "kind": fk or None})
         s["forms"] = forms
@@ -955,7 +954,7 @@ def interactive_config(tier_map, annotations, stem, directory_mode=False):
             if val:
                 state["object_lang"] = val
                 return
-            print("  A language code is required — please type one.")
+            print("  A language code is required — please type one (e.g. tvk, fr, bod).")
 
     def _set_seg_tiers(state, seg):
         multi = len(seg) > 1
@@ -1214,11 +1213,11 @@ def build_segments(annotations, children, tier_map, cfg):
         pos_sep  = spk.get("morph_pos_sep", "")
 
         for mid in collect_descendants(parent_id, mtid, children, annotations):
-            m_val = annotations[mid]["value"].strip("-")
+            m_val = annotations[mid]["value"].strip()
 
             if pos_tid:
                 for pid in collect_descendants(mid, pos_tid, children, annotations):
-                    pv = annotations[pid]["value"].strip("-")
+                    pv = annotations[pid]["value"].strip()
                     if pv:
                         m_val = m_val + pos_sep + pv
                         break
@@ -1227,7 +1226,7 @@ def build_segments(annotations, children, tier_map, cfg):
             if gtid:
                 for gid in collect_descendants(mid, gtid, children, annotations):
                     if annotations[gid]["value"]:
-                        gloss = annotations[gid]["value"].strip("-")
+                        gloss = annotations[gid]["value"].strip()
                         break
 
             morphs.append({"form": m_val, "gloss": gloss, "gloss_lang": gls_lang})
@@ -1696,7 +1695,7 @@ def process_directory(eaf_dir, output_dir, config=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert ELAN .eaf to Pangloss/Cocoon XML.",
+        description="Convert ELAN .eaf to Pangloss XML.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

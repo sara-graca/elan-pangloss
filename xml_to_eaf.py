@@ -43,30 +43,19 @@ Both TEXT and WORDLIST documents are supported.  Multi-speaker documents (units
 carrying who="…") are split onto per-speaker tiers ("tx@SP1", "tx@SP2", …) with
 the PARTICIPANT attribute set.
 
-Tier structure produced
------------------------
-  phono tier       : ALIGNABLE_ANNOTATION  (time-aligned to the audio)
-  translation(s)   : REF_ANNOTATION        Symbolic_Association  under phono
-  ortho            : REF_ANNOTATION        Symbolic_Association  under phono
-  notes            : REF_ANNOTATION        Symbolic_Subdivision  under phono
-  word             : REF_ANNOTATION        Symbolic_Subdivision  under phono  (TEXT only)
-  word gloss       : REF_ANNOTATION        Symbolic_Association  under word
-  morpheme         : REF_ANNOTATION        Symbolic_Subdivision  under word (TEXT)
-                                                                  or phono (WORDLIST)
-  morpheme gloss   : REF_ANNOTATION        Symbolic_Association  under morpheme
-
-Config file format (JSON)
---------------------------
+Config format (JSON)
+--------------------
 {
-  "phono_tier"    : "tx",
+  "forms"         : [{"kind": "phono", "tier": "tx"},
+                     {"kind": "ortho", "tier": "ortho"}],
   "transl_tiers"  : {"fr": "ft"},
-  "ortho_tier"    : "ortho",
   "notes_tier"    : "notes",
   "word_tier"     : "word",
   "word_gls_tier" : "ge_w",
   "morph_tier"    : "mb",
   "morph_gls_tier": "ge_m"
 }
+The first entry of "forms" is the time-aligned transcription tier.
 """
 
 import sys
@@ -83,10 +72,9 @@ _AUDIO_MIME = {"wav": "audio/x-wav", "mp3": "audio/mpeg", "flac": "audio/x-flac"
                "m4a": "audio/mp4"}
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# --- Helpers ---
 
 def sec_to_ms(s):
-    """'1.234' → 1234"""
     try:
         return round(float(s) * 1000)
     except (TypeError, ValueError):
@@ -99,22 +87,9 @@ def _esc_attr(text):
     return _esc(text).replace('"', "&quot;")
 
 
-# ─── Parse Pangloss XML ───────────────────────────────────────────────────────
+# --- Parse Pangloss XML ---
 
 def parse_xml(path):
-    """
-    Returns (text_id, object_lang, is_wordlist, soundfile, units).
-
-    Each unit dict:
-        ts1, ts2 : int  milliseconds
-        phono    : str
-        ortho    : str
-        transl   : list of (lang, text) tuples  — preserves order
-        notes    : list of str
-        who      : str
-        words    : list of {form, gls, morphs:[{form, gloss}]}   (TEXT only)
-        morphs   : list of {form, gloss}                          (WORDLIST only)
-    """
     root = ET.parse(path).getroot()
     is_wordlist = (root.tag == "WORDLIST")
     unit_tag = "W" if is_wordlist else "S"
@@ -127,27 +102,12 @@ def parse_xml(path):
     soundfile = sf_el.get("href", "").strip() if sf_el is not None else ""
 
     def forms_of(elem):
-        phono = ortho = ""
-        first = ""
-        for form in elem.findall("FORM"):
-            txt = (form.text or "").strip()
-            kind = form.get("kindOf", "")
-            if not first:
-                first = txt
-            if kind == "phono":
-                phono = txt
-            elif kind == "ortho":
-                ortho = txt
-        # If no kindOf labels were used, treat the first FORM as the phono line.
-        if not phono:
-            phono = first
-        return phono, ortho
+        return [(form.get("kindOf", ""), (form.text or "").strip())
+                for form in elem.findall("FORM")]
 
     def transl_of(elem):
-        return [
-            (t.get(f"{{{XML_NS}}}lang", ""), (t.text or "").strip())
-            for t in elem.findall("TRANSL")
-        ]
+        return [(t.get(f"{{{XML_NS}}}lang", ""), (t.text or "").strip())
+                for t in elem.findall("TRANSL")]
 
     def notes_of(elem):
         return [n.get("message", "").strip()
@@ -167,15 +127,12 @@ def parse_xml(path):
         audio = u_elem.find("AUDIO")
         ts1 = sec_to_ms(audio.get("start", "0")) if audio is not None else 0
         ts2 = sec_to_ms(audio.get("end",   "0")) if audio is not None else 0
-        phono, ortho = forms_of(u_elem)
-
         unit = {
-            "ts1": ts1, "ts2": ts2, "phono": phono, "ortho": ortho,
+            "ts1": ts1, "ts2": ts2, "forms": forms_of(u_elem),
             "transl": transl_of(u_elem), "notes": notes_of(u_elem),
             "who": u_elem.get("who", ""), "words": [], "morphs": [],
         }
         if is_wordlist:
-            # A wordlist entry IS the word: its <M> children are its morphemes.
             unit["morphs"] = morphs_of(u_elem)
         else:
             words = []
@@ -191,14 +148,27 @@ def parse_xml(path):
     return text_id, object_lang, is_wordlist, soundfile, units
 
 
-# ─── Content flags ─────────────────────────────────────────────────────────────
+def _form_text(unit_forms, kind):
+    for k, t in unit_forms:
+        if k == kind:
+            return t
+    if kind == "" and unit_forms:
+        return unit_forms[0][1]
+    return ""
+
+
+# --- Content flags ---
 
 def _content_flags(units, is_wordlist):
-    """Return what kinds of content are present, to drive tier suggestions."""
-    transl_langs = list(dict.fromkeys(
-        lang for u in units for lang, _ in u["transl"]
-    ))
-    has_ortho = any(u["ortho"] for u in units)
+    form_kinds = []
+    for u in units:
+        for k, _ in u["forms"]:
+            if k not in form_kinds:
+                form_kinds.append(k)
+    if not form_kinds:
+        form_kinds = [""]
+
+    transl_langs = list(dict.fromkeys(lang for u in units for lang, _ in u["transl"]))
     has_notes = any(u["notes"] for u in units)
     if is_wordlist:
         has_words = has_w_gls = False
@@ -211,19 +181,18 @@ def _content_flags(units, is_wordlist):
         has_m_gls  = any(m["gloss"] for u in units
                          for w in u["words"] for m in w["morphs"])
     speakers = [w for w in dict.fromkeys(u["who"] for u in units) if w]
-    return dict(transl_langs=transl_langs, has_ortho=has_ortho, has_notes=has_notes,
+    return dict(form_kinds=form_kinds, transl_langs=transl_langs, has_notes=has_notes,
                 has_words=has_words, has_w_gls=has_w_gls, has_morphs=has_morphs,
                 has_m_gls=has_m_gls, speakers=speakers)
 
 
 def _structure_signature(is_wordlist, flags):
-    """Hashable fingerprint of a document's content shape, for grouping files."""
-    return (is_wordlist, flags["has_ortho"], tuple(flags["transl_langs"]),
+    return (is_wordlist, tuple(flags["form_kinds"]), tuple(flags["transl_langs"]),
             flags["has_notes"], flags["has_words"], flags["has_w_gls"],
             flags["has_morphs"], flags["has_m_gls"], tuple(sorted(flags["speakers"])))
 
 
-# ─── Inspect ──────────────────────────────────────────────────────────────────
+# --- Inspect ---
 
 def inspect_xml(text_id, object_lang, is_wordlist, soundfile, units):
     f = _content_flags(units, is_wordlist)
@@ -238,10 +207,10 @@ def inspect_xml(text_id, object_lang, is_wordlist, soundfile, units):
     print()
 
     def yn(b): return "yes" if b else "no"
+    kinds = ", ".join((k or "(no kindOf)") for k in f["form_kinds"])
     tl = ", ".join(repr(l) for l in f["transl_langs"]) if f["transl_langs"] else "no"
     print("Content:")
-    print("  Transcription (phono)  : yes")
-    print(f"  Orthographic form      : {yn(f['has_ortho'])}")
+    print(f"  Transcription forms    : {kinds}")
     print(f"  Translations           : {tl}")
     print(f"  Notes                  : {yn(f['has_notes'])}")
     if not is_wordlist:
@@ -252,7 +221,7 @@ def inspect_xml(text_id, object_lang, is_wordlist, soundfile, units):
     print()
 
 
-# ─── Interactive config ───────────────────────────────────────────────────────
+# --- Interactive config ---
 
 def _ask(prompt, default=""):
     suffix = f"\n  (press Enter to use \"{default}\")" if default else ""
@@ -260,46 +229,60 @@ def _ask(prompt, default=""):
     return val if val else default
 
 
+def _yesno(prompt, default=True):
+    d = "Y/n" if default else "y/N"
+    raw = input(f"{prompt} [{d}]: ").strip().lower()
+    return default if not raw else raw in ("y", "yes")
+
+
+def _default_form_name(kind, used):
+    base = {"phono": "tx", "": "tx", "ortho": "ortho"}.get(kind, kind or "tx")
+    name, i = base, 2
+    while name in used:
+        name = f"{base}_{i}"; i += 1
+    used.add(name)
+    return name
+
+
+def _form_label(kind, idx):
+    role = "Main transcription" if idx == 0 else "Transcription"
+    return f"{role} ({kind or 'no kindOf'})"
+
+
 def _show_summary(cfg):
     print()
     print("=" * 60)
     print("Summary of your choices")
     print("=" * 60)
-    print(f"  Transcription tier    : {cfg['phono_tier']}")
+    for idx, fm in enumerate(cfg.get("forms") or []):
+        tag = "  (time-aligned)" if idx == 0 else ""
+        print(f"  {_form_label(fm.get('kind',''), idx):34s}: {fm['tier']}{tag}")
     for lang, tname in (cfg.get("transl_tiers") or {}).items():
         label = lang if lang else "(no lang code)"
-        print(f"  Translation ({label:8s}): {tname}")
+        print(f"  Translation ({label:8s})       : {tname}")
     def opt(k): return cfg.get(k) or "(none)"
-    print(f"  Orthography tier      : {opt('ortho_tier')}")
-    print(f"  Notes tier            : {opt('notes_tier')}")
-    print(f"  Word tier             : {opt('word_tier')}")
-    print(f"  Word gloss tier       : {opt('word_gls_tier')}")
-    print(f"  Morpheme tier         : {opt('morph_tier')}")
-    print(f"  Morpheme gloss tier   : {opt('morph_gls_tier')}")
+    print(f"  Notes tier                      : {opt('notes_tier')}")
+    print(f"  Word tier                       : {opt('word_tier')}")
+    print(f"  Word gloss tier                 : {opt('word_gls_tier')}")
+    print(f"  Morpheme tier                   : {opt('morph_tier')}")
+    print(f"  Morpheme gloss tier             : {opt('morph_gls_tier')}")
     print()
 
 
 def _predefined_cfg(is_wordlist, f):
-    """Standard tier names based on what content is present.
-
-    'ge' follows the SIL convention (gloss at the deepest level present); when
-    both word and morpheme glosses exist we disambiguate with ge_w / ge_m.
-    In a wordlist there is no word layer, so morphemes hang under the phono tier.
-    """
+    used = set()
+    forms = [{"kind": k, "tier": _default_form_name(k, used)} for k in f["form_kinds"]]
     langs = f["transl_langs"]
     if len(langs) == 1:
         transl_map = {langs[0]: "ft"}
     else:
         transl_map = {lang: (f"ft_{lang}" if lang else "ft") for lang in langs}
-
     has_words = f["has_words"] and not is_wordlist
     both_gls = f["has_w_gls"] and f["has_m_gls"] and f["has_morphs"] and has_words
-    # morphemes need a word layer in TEXT; in WORDLIST they attach to phono.
     morph_ok = f["has_morphs"] and (has_words or is_wordlist)
     return {
-        "phono_tier":     "tx",
+        "forms":          forms,
         "transl_tiers":   transl_map,
-        "ortho_tier":     "ortho" if f["has_ortho"] else None,
         "notes_tier":     "notes" if f["has_notes"] else None,
         "word_tier":      "word"  if has_words else None,
         "word_gls_tier":  ("ge_w" if both_gls else "ge")
@@ -311,52 +294,43 @@ def _predefined_cfg(is_wordlist, f):
 
 
 def _show_predefined(is_wordlist, f):
-    rows = [("tx", "Main transcription (phonetic)", "<FORM kindOf='phono'>")]
-    if len(f["transl_langs"]) == 1:
-        rows.append(("ft", "Free translation", "<TRANSL>"))
-    else:
-        for lang in f["transl_langs"]:
-            rows.append((f"ft_{lang}" if lang else "ft",
-                         f"Free translation ({lang or '?'})", "<TRANSL>"))
-    if f["has_ortho"]:
-        rows.append(("ortho", "Orthographic form", "<FORM kindOf='ortho'>"))
-    if f["has_notes"]:
-        rows.append(("notes", "Notes / comments", "<NOTE>"))
-    has_words = f["has_words"] and not is_wordlist
-    both_gls = f["has_w_gls"] and f["has_m_gls"] and f["has_morphs"] and has_words
-    morph_ok = f["has_morphs"] and (has_words or is_wordlist)
-    if has_words:
-        rows.append(("word", "Word segmentation", "<W>"))
-    if f["has_w_gls"] and has_words:
-        rows.append(("ge_w" if both_gls else "ge", "Word gloss", "<W><TRANSL>"))
-    if morph_ok:
-        rows.append(("mb", "Morpheme break", "<M><FORM>"))
-    if f["has_m_gls"] and morph_ok:
-        rows.append(("ge_m" if both_gls else "ge", "Morpheme gloss", "<M><TRANSL>"))
-
+    cfg = _predefined_cfg(is_wordlist, f)
     print()
     print("Standard tier names:")
     print()
-    for name, role, xml in rows:
-        print(f"  {name:8s}  {role:35s}  [XML: {xml}]")
+    for idx, fm in enumerate(cfg["forms"]):
+        xml = "<FORM>" if idx == 0 and not fm["kind"] else f"<FORM kindOf='{fm['kind']}'>"
+        tag = "  (time-aligned)" if idx == 0 else ""
+        print(f"  {fm['tier']:8s}  {_form_label(fm['kind'], idx):32s}  [XML: {xml}]{tag}")
+    for lang, tname in (cfg["transl_tiers"] or {}).items():
+        print(f"  {tname:8s}  {('Free translation ('+(lang or '?')+')'):32s}  [XML: <TRANSL>]")
+    for key, role, xml in (("notes_tier", "Notes / comments", "<NOTE>"),
+                           ("word_tier", "Word segmentation", "<W>"),
+                           ("word_gls_tier", "Word gloss", "<W><TRANSL>"),
+                           ("morph_tier", "Morpheme break", "<M><FORM>"),
+                           ("morph_gls_tier", "Morpheme gloss", "<M><TRANSL>")):
+        if cfg.get(key):
+            print(f"  {cfg[key]:8s}  {role:32s}  [XML: {xml}]")
     print()
 
 
 def _custom_cfg(is_wordlist, f):
     has_words = f["has_words"] and not is_wordlist
     while True:
-        cfg = {"phono_tier": _ask("Main transcription tier name", "tx"),
-               "transl_tiers": {}}
+        used = set()
+        forms = []
+        for idx, kind in enumerate(f["form_kinds"]):
+            default = _default_form_name(kind, used)
+            name = _ask(_form_label(kind, idx) + " tier name", default)
+            forms.append({"kind": kind, "tier": name})
+        cfg = {"forms": forms, "transl_tiers": {}}
         for lang in f["transl_langs"]:
             default_name = f"ft_{lang}" if lang else "ft"
             cfg["transl_tiers"][lang] = _ask(
                 f"Translation tier name (language: {lang!r})" if lang
-                else "Translation tier name (no language code in XML)",
-                default_name)
-        cfg["ortho_tier"] = _ask("Orthography tier name", "ortho") if f["has_ortho"] else None
+                else "Translation tier name (no language code in XML)", default_name)
         cfg["notes_tier"] = _ask("Notes tier name", "notes") if f["has_notes"] else None
         cfg["word_tier"]  = _ask("Word tier name", "word") if has_words else None
-
         both_gls = f["has_w_gls"] and f["has_m_gls"] and f["has_morphs"] and cfg["word_tier"]
         cfg["word_gls_tier"] = (
             _ask("Word gloss tier name", "ge_w" if both_gls else "ge")
@@ -368,15 +342,13 @@ def _custom_cfg(is_wordlist, f):
             if f["has_m_gls"] and cfg["morph_tier"] else None)
 
         _show_summary(cfg)
-        answer = input("Does this look correct? [yes / no, start over]: ").strip().lower()
-        if answer in ("y", "yes", ""):
+        if _yesno("Does this look correct?", True):
             return cfg
         print("\nStarting over — please re-enter your choices.\n")
 
 
 def interactive_config(is_wordlist, units, save=True):
     f = _content_flags(units, is_wordlist)
-
     _show_predefined(is_wordlist, f)
     choice = input(
         "Use these standard names, or choose custom names? [standard / custom]: "
@@ -386,13 +358,9 @@ def interactive_config(is_wordlist, units, save=True):
     if choice in ("s", "standard", ""):
         cfg = _predefined_cfg(is_wordlist, f)
         _show_summary(cfg)
-        answer = input(
-            "Does this look correct? [yes / no, choose custom names instead]: "
-        ).strip().lower()
-        if answer not in ("y", "yes", ""):
+        if not _yesno("Does this look correct?", True):
             print("\nSwitching to custom names.\n")
             cfg = None
-
     if cfg is None:
         print("=" * 60)
         print("Tier naming")
@@ -405,10 +373,9 @@ def interactive_config(is_wordlist, units, save=True):
     return cfg
 
 
-# ─── Config saving (crash-safe) ────────────────────────────────────────────────
+# --- Config saving (crash-safe) ---
 
 def _write_config(cfg, path):
-    """Write one config to `path`, creating parent dirs. Returns True on success."""
     try:
         p = Path(path)
         if p.parent and not p.parent.exists():
@@ -436,7 +403,6 @@ def _save_cfg_interactive(cfg):
 
 
 def _save_configs_per_file(configs, folder):
-    """Save one '<xml stem>.json' per file into `folder` (created if needed)."""
     folder = Path(folder)
     try:
         folder.mkdir(parents=True, exist_ok=True)
@@ -465,10 +431,9 @@ def _save_configs_per_file_interactive(configs):
             return
 
 
-# ─── Build EAF ────────────────────────────────────────────────────────────────
+# --- Build EAF ---
 
 def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
-    """Generate an EAF XML string from units and config."""
     _ann = [0]
     _ts  = [0]
     ts_slots = []
@@ -483,17 +448,23 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
         ts_slots.append((tsid, ms))
         return tsid
 
+    forms = cfg.get("forms") or [{"kind": "", "tier": "tx"}]
+    main_form, extra_forms = forms[0], forms[1:]
+
     def collect(units_sub):
-        """Collect annotation tuples for one speaker's units."""
-        b = {"phono": [], "transl": defaultdict(list), "ortho": [], "notes": [],
-             "word": [], "word_gls": [], "morph": [], "morph_gls": []}
+        b = {"phono": [], "extra": defaultdict(list), "transl": defaultdict(list),
+             "notes": [], "word": [], "word_gls": [], "morph": [], "morph_gls": []}
         for u in units_sub:
             s_id = new_id()
-            b["phono"].append((s_id, ts_id(u["ts1"]), ts_id(u["ts2"]), u["phono"]))
+            b["phono"].append((s_id, ts_id(u["ts1"]), ts_id(u["ts2"]),
+                               _form_text(u["forms"], main_form.get("kind", ""))))
+            for fm in extra_forms:
+                txt = _form_text(u["forms"], fm.get("kind", ""))
+                if txt:
+                    b["extra"][fm["tier"]].append((new_id(), s_id, None, txt))
             for lang, text in u["transl"]:
-                b["transl"][lang].append((new_id(), s_id, None, text))
-            if cfg.get("ortho_tier") and u["ortho"]:
-                b["ortho"].append((new_id(), s_id, None, u["ortho"]))
+                if text:
+                    b["transl"][lang].append((new_id(), s_id, None, text))
             if cfg.get("notes_tier"):
                 prev = None
                 for note in u["notes"]:
@@ -510,7 +481,7 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
                         b["morph_gls"].append((new_id(), mid, None, m["gloss"]))
 
             if is_wordlist:
-                add_morphs(s_id, u["morphs"])          # morphemes under phono
+                add_morphs(s_id, u["morphs"])
             elif cfg.get("word_tier"):
                 prev_w = None
                 for w in u["words"]:
@@ -518,10 +489,9 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
                     b["word"].append((w_id, s_id, prev_w, w["form"])); prev_w = w_id
                     if cfg.get("word_gls_tier") and w["gls"]:
                         b["word_gls"].append((new_id(), w_id, None, w["gls"]))
-                    add_morphs(w_id, w["morphs"])       # morphemes under word
+                    add_morphs(w_id, w["morphs"])
         return b
 
-    # ── speaker groups ────────────────────────────────────────────────────────
     distinct = [w for w in dict.fromkeys(u["who"] for u in units) if w]
     if len(distinct) <= 1:
         groups = [("", distinct[0] if distinct else "", units)]
@@ -533,7 +503,6 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
 
     speaker_blocks = [(suffix, who, collect(sub)) for suffix, who, sub in groups]
 
-    # ── assemble ──────────────────────────────────────────────────────────────
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -568,8 +537,8 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
         attrs += f' TIER_ID="{_esc_attr(tier_id)}"'
         return f'    <TIER{attrs}>'
 
-    def write_alignable(tier_id, ltype, anns, lang_ref=None, participant=None):
-        lines.append(tier_header(tier_id, ltype, lang_ref=lang_ref, participant=participant))
+    def write_alignable(tier_id, anns, lang_ref=None, participant=None):
+        lines.append(tier_header(tier_id, "default-lt", lang_ref=lang_ref, participant=participant))
         for aid, ts1, ts2, value in anns:
             lines.extend([
                 '        <ANNOTATION>',
@@ -600,24 +569,21 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
         part = who or None
         def nm(base):
             return base + suffix
-        phono_name = nm(cfg["phono_tier"])
-        write_alignable(phono_name, "default-lt", b["phono"],
-                        lang_ref=object_lang or None, participant=part)
+        phono_name = nm(main_form["tier"])
+        write_alignable(phono_name, b["phono"], lang_ref=object_lang or None, participant=part)
+        for fm in extra_forms:
+            if b["extra"].get(fm["tier"]):
+                write_ref(nm(fm["tier"]), "symassoc", phono_name,
+                          b["extra"][fm["tier"]], participant=part)
         for lang, tname in (cfg.get("transl_tiers") or {}).items():
             if b["transl"][lang]:
                 write_ref(nm(tname), "symassoc", phono_name, b["transl"][lang],
                           lang_ref=lang or None, participant=part)
-        if cfg.get("ortho_tier") and b["ortho"]:
-            write_ref(nm(cfg["ortho_tier"]), "symassoc", phono_name, b["ortho"],
-                      participant=part)
         if cfg.get("notes_tier") and b["notes"]:
-            write_ref(nm(cfg["notes_tier"]), "symsub", phono_name, b["notes"],
-                      participant=part)
-        # WORDLIST: morphemes hang directly under phono; TEXT: under the word tier.
+            write_ref(nm(cfg["notes_tier"]), "symsub", phono_name, b["notes"], participant=part)
         if is_wordlist:
             if cfg.get("morph_tier") and b["morph"]:
-                write_ref(nm(cfg["morph_tier"]), "symsub", phono_name, b["morph"],
-                          participant=part)
+                write_ref(nm(cfg["morph_tier"]), "symsub", phono_name, b["morph"], participant=part)
                 if cfg.get("morph_gls_tier") and b["morph_gls"]:
                     write_ref(nm(cfg["morph_gls_tier"]), "symassoc",
                               nm(cfg["morph_tier"]), b["morph_gls"], participant=part)
@@ -628,13 +594,11 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
                 write_ref(nm(cfg["word_gls_tier"]), "symassoc", word_name,
                           b["word_gls"], participant=part)
             if cfg.get("morph_tier") and b["morph"]:
-                write_ref(nm(cfg["morph_tier"]), "symsub", word_name, b["morph"],
-                          participant=part)
+                write_ref(nm(cfg["morph_tier"]), "symsub", word_name, b["morph"], participant=part)
                 if cfg.get("morph_gls_tier") and b["morph_gls"]:
                     write_ref(nm(cfg["morph_gls_tier"]), "symassoc",
                               nm(cfg["morph_tier"]), b["morph_gls"], participant=part)
 
-    # ── linguistic types ──────────────────────────────────────────────────────
     lines.extend([
         '    <LINGUISTIC_TYPE GRAPHIC_REFERENCES="false"'
         ' LINGUISTIC_TYPE_ID="default-lt" TIME_ALIGNABLE="true"/>',
@@ -646,7 +610,6 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
         ' TIME_ALIGNABLE="false"/>',
     ])
 
-    # ── languages (one per referenced LANG_REF) ───────────────────────────────
     lang_codes = []
     if object_lang:
         lang_codes.append(object_lang)
@@ -657,7 +620,6 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
         lid = _esc_attr(code)
         lines.append(f'    <LANGUAGE LANG_DEF="{lid}" LANG_ID="{lid}" LANG_LABEL="{lid}"/>')
 
-    # ── constraints ────────────────────────────────────────────────────────────
     lines.extend([
         '    <CONSTRAINT DESCRIPTION="Time subdivision of parent annotation\'s'
         ' time interval, no time gaps allowed within this interval"'
@@ -675,7 +637,7 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
     return "\n".join(lines) + "\n"
 
 
-# ─── Directory mode ────────────────────────────────────────────────────────────
+# --- Directory mode ---
 
 def _convert_one(path, cfg, output_dir):
     text_id, object_lang, is_wordlist, soundfile, units = parse_xml(str(path))
@@ -688,7 +650,6 @@ def _convert_one(path, cfg, output_dir):
 
 
 def _group_xmls(xml_paths):
-    """Group XML files by content shape.  Returns [(is_wordlist, units, [paths])]."""
     groups = {}
     for path in xml_paths:
         try:
@@ -704,7 +665,6 @@ def _group_xmls(xml_paths):
 
 
 def _interactive_configs(xml_paths):
-    """Group XMLs by content shape, ask once per group. Returns [(cfg, [paths])]."""
     groups = _group_xmls(xml_paths)
     configs = []
     multi = len(groups) > 1
@@ -726,16 +686,7 @@ def _interactive_configs(xml_paths):
     return configs
 
 
-def _yesno(prompt, default=True):
-    d = "Y/n" if default else "y/N"
-    raw = input(f"{prompt} [{d}]: ").strip().lower()
-    if not raw:
-        return default
-    return raw in ("y", "yes")
-
-
 def _load_folder_configs(config_dir):
-    """Load every <name>.json in the folder as (name, cfg)."""
     out = []
     for p in sorted(config_dir.glob("*.json")):
         try:
@@ -748,16 +699,16 @@ def _load_folder_configs(config_dir):
     return out
 
 
+def _config_form_kinds(cfg):
+    return {fm.get("kind", "") for fm in (cfg.get("forms") or [])}
+
+
 def _config_covers(cfg, flags, is_wordlist):
-    """
-    True if `cfg` can represent everything the file contains, without dropping
-    data: it defines a tier for every kind of content present, and provides a
-    translation tier for every translation language in the file.
-    """
-    cfg_langs = set((cfg.get("transl_tiers") or {}).keys())
-    if not set(flags["transl_langs"]) <= cfg_langs:
+    if not cfg.get("forms"):
         return False
-    if flags["has_ortho"] and not cfg.get("ortho_tier"):
+    if not set(flags["form_kinds"]) <= _config_form_kinds(cfg):
+        return False
+    if not set(flags["transl_langs"]) <= set((cfg.get("transl_tiers") or {}).keys()):
         return False
     if flags["has_notes"] and not cfg.get("notes_tier"):
         return False
@@ -766,8 +717,6 @@ def _config_covers(cfg, flags, is_wordlist):
     if flags["has_w_gls"] and not cfg.get("word_gls_tier"):
         return False
     if flags["has_morphs"]:
-        # In a TEXT, morphemes hang under the word tier, so both are required;
-        # in a WORDLIST they hang under the phono tier, so only morph is needed.
         if not cfg.get("morph_tier"):
             return False
         if not is_wordlist and not cfg.get("word_tier"):
@@ -778,9 +727,7 @@ def _config_covers(cfg, flags, is_wordlist):
 
 
 def _config_specificity(cfg, flags, is_wordlist):
-    """Higher = a tighter fit: exact language match, more content used, less waste."""
     optional = [
-        ("ortho_tier", flags["has_ortho"]),
         ("notes_tier", flags["has_notes"]),
         ("word_tier", flags["has_words"] and not is_wordlist),
         ("word_gls_tier", flags["has_w_gls"]),
@@ -789,15 +736,12 @@ def _config_specificity(cfg, flags, is_wordlist):
     ]
     used = sum(1 for k, present in optional if cfg.get(k) and present)
     unused = sum(1 for k, present in optional if cfg.get(k) and not present)
+    exact_forms = _config_form_kinds(cfg) == set(flags["form_kinds"])
     exact_lang = set((cfg.get("transl_tiers") or {}).keys()) == set(flags["transl_langs"])
-    return (exact_lang, used, -unused)
+    return (exact_forms, exact_lang, used, -unused)
 
 
 def _propose_matches(xml_paths, folder_configs):
-    """
-    For each XML, choose the most fitting config that can represent its content.
-    Returns (mapping {path: (name, cfg)}, unmatched [paths]).
-    """
     mapping, unmatched = {}, []
     for path in xml_paths:
         try:
@@ -821,7 +765,6 @@ def _propose_matches(xml_paths, folder_configs):
 
 
 def _confirm_and_adjust_mapping(xml_paths, mapping, unmatched, folder_configs):
-    """Show the proposed file→config mapping and let the user confirm or edit it."""
     print("\nProposed config for each file (matched by content shape):")
     for path in xml_paths:
         if path in mapping:
@@ -858,11 +801,6 @@ def _confirm_and_adjust_mapping(xml_paths, mapping, unmatched, folder_configs):
 
 
 def _convert_with_config_folder(xml_paths, output_dir, config_dir):
-    """
-    Match each XML to a config in `config_dir` by CONTENT SHAPE (not filename),
-    confirm the mapping, then convert.  Files no config can represent are
-    configured interactively and saved into the folder; unused configs ignored.
-    """
     folder_configs = _load_folder_configs(config_dir)
     mapping, unmatched = _propose_matches(xml_paths, folder_configs)
     if folder_configs:
@@ -874,8 +812,6 @@ def _convert_with_config_folder(xml_paths, output_dir, config_dir):
         for path in xml_paths:
             if path in mapping:
                 _convert_one(path, mapping[path][1], output_dir)
-
-    # Configs that matched no file are never used → ignored.
 
     if unmatched:
         print(f"\n{len(unmatched)} file(s) need a new config — let's set them up.")
@@ -899,12 +835,10 @@ def process_directory(xml_dir, output_dir, config=None):
         print(f"Config path not found: {cfg_path}", file=sys.stderr)
         sys.exit(1)
 
-    # config FOLDER: match each XML to <stem>.json
     if cfg_path and cfg_path.is_dir():
         _convert_with_config_folder(xml_paths, output_dir, cfg_path)
         return
 
-    # single config FILE: one mapping for every file
     if cfg_path and cfg_path.is_file():
         with open(cfg_path, encoding="utf-8-sig") as fh:
             cfg = json.load(fh)
@@ -913,7 +847,6 @@ def process_directory(xml_dir, output_dir, config=None):
             _convert_one(path, cfg, output_dir)
         return
 
-    # no config: interview (grouped by shape), save per file, convert
     print(f"Scanning {len(xml_paths)} XML file(s)...")
     configs = _interactive_configs(xml_paths)
     _save_configs_per_file_interactive(configs)
@@ -923,7 +856,7 @@ def process_directory(xml_dir, output_dir, config=None):
             _convert_one(path, cfg, output_dir)
 
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+# --- Entry point ---
 
 def main():
     parser = argparse.ArgumentParser(
@@ -943,14 +876,12 @@ def main():
 
     input_path = Path(args.input)
 
-    # ── Directory mode ─────────────────────────────────────────────────────────
     if input_path.is_dir():
         if not args.output:
             parser.error("output directory is required when input is a directory")
         process_directory(str(input_path), args.output, args.config)
         return
 
-    # ── Single-file mode ───────────────────────────────────────────────────────
     text_id, object_lang, is_wordlist, soundfile, units = parse_xml(str(input_path))
     inspect_xml(text_id, object_lang, is_wordlist, soundfile, units)
 
