@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 xml_to_eaf.py — Convert Pangloss/Cocoon XML files to ELAN .eaf format.
 
@@ -30,9 +29,15 @@ template; add more for the multispeaker or wordlist variants. Files no config
 fits are set up interactively and saved into the folder; unused configs are
 ignored.
 
+Tier structure produced
+-----------------------
+Both TEXT and WORDLIST documents are supported.  Multi-speaker documents (units
+with who="…") are split onto per-speaker tiers ("ref@SP1", "tx@SP1", …).
+
 Config format (JSON)
 --------------------
 {
+  "ref_tier"      : "ref",
   "forms"         : [{"kind": "phono", "tier": "tx"},
                      {"kind": "ortho", "tier": "ortho"}],
   "transl_tiers"  : {"fr": "ft"},
@@ -42,7 +47,6 @@ Config format (JSON)
   "morph_tier"    : "mb",
   "morph_gls_tier": "ge_m"
 }
-The first entry of "forms" is the time-aligned transcription tier.
 """
 
 import sys
@@ -115,7 +119,8 @@ def parse_xml(path):
         ts1 = sec_to_ms(audio.get("start", "0")) if audio is not None else 0
         ts2 = sec_to_ms(audio.get("end",   "0")) if audio is not None else 0
         unit = {
-            "ts1": ts1, "ts2": ts2, "forms": forms_of(u_elem),
+            "ts1": ts1, "ts2": ts2, "id": u_elem.get("id", ""),
+            "forms": forms_of(u_elem),
             "transl": transl_of(u_elem), "notes": notes_of(u_elem),
             "who": u_elem.get("who", ""), "words": [], "morphs": [],
         }
@@ -232,7 +237,7 @@ def _default_form_name(kind, used):
 
 
 def _form_label(kind, idx):
-    role = "Main transcription" if idx == 0 else "Transcription"
+    role = "Transcription"
     return f"{role} ({kind or 'no kindOf'})"
 
 
@@ -241,9 +246,10 @@ def _show_summary(cfg):
     print("=" * 60)
     print("Summary of your choices")
     print("=" * 60)
+    print(f"  Sentence/reference tier         : {cfg.get('ref_tier') or 'ref'}"
+          f"  (time-aligned)")
     for idx, fm in enumerate(cfg.get("forms") or []):
-        tag = "  (time-aligned)" if idx == 0 else ""
-        print(f"  {_form_label(fm.get('kind',''), idx):34s}: {fm['tier']}{tag}")
+        print(f"  {_form_label(fm.get('kind',''), idx):34s}: {fm['tier']}")
     for lang, tname in (cfg.get("transl_tiers") or {}).items():
         label = lang if lang else "(no lang code)"
         print(f"  Translation ({label:8s})       : {tname}")
@@ -268,6 +274,7 @@ def _predefined_cfg(is_wordlist, f):
     both_gls = f["has_w_gls"] and f["has_m_gls"] and f["has_morphs"] and has_words
     morph_ok = f["has_morphs"] and (has_words or is_wordlist)
     return {
+        "ref_tier":       "ref",
         "forms":          forms,
         "transl_tiers":   transl_map,
         "notes_tier":     "notes" if f["has_notes"] else None,
@@ -285,10 +292,11 @@ def _show_predefined(is_wordlist, f):
     print()
     print("Standard tier names:")
     print()
+    print(f"  {cfg['ref_tier']:8s}  {'Sentence / reference id':32s}  "
+          f"[XML: <S id> / <W id>]  (time-aligned)")
     for idx, fm in enumerate(cfg["forms"]):
         xml = "<FORM>" if idx == 0 and not fm["kind"] else f"<FORM kindOf='{fm['kind']}'>"
-        tag = "  (time-aligned)" if idx == 0 else ""
-        print(f"  {fm['tier']:8s}  {_form_label(fm['kind'], idx):32s}  [XML: {xml}]{tag}")
+        print(f"  {fm['tier']:8s}  {_form_label(fm['kind'], idx):32s}  [XML: {xml}]")
     for lang, tname in (cfg["transl_tiers"] or {}).items():
         print(f"  {tname:8s}  {('Free translation ('+(lang or '?')+')'):32s}  [XML: <TRANSL>]")
     for key, role, xml in (("notes_tier", "Notes / comments", "<NOTE>"),
@@ -304,13 +312,15 @@ def _show_predefined(is_wordlist, f):
 def _custom_cfg(is_wordlist, f):
     has_words = f["has_words"] and not is_wordlist
     while True:
+        cfg = {"ref_tier": _ask("Sentence/reference tier name (time-aligned)", "ref")}
         used = set()
         forms = []
         for idx, kind in enumerate(f["form_kinds"]):
             default = _default_form_name(kind, used)
             name = _ask(_form_label(kind, idx) + " tier name", default)
             forms.append({"kind": kind, "tier": name})
-        cfg = {"forms": forms, "transl_tiers": {}}
+        cfg["forms"] = forms
+        cfg["transl_tiers"] = {}
         for lang in f["transl_langs"]:
             default_name = f"ft_{lang}" if lang else "ft"
             cfg["transl_tiers"][lang] = _ask(
@@ -436,26 +446,42 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
         return tsid
 
     forms = cfg.get("forms") or [{"kind": "", "tier": "tx"}]
-    main_form, extra_forms = forms[0], forms[1:]
+    primary = forms[0]
+    ref_name = cfg.get("ref_tier") or "ref"
 
     def collect(units_sub):
-        b = {"phono": [], "extra": defaultdict(list), "transl": defaultdict(list),
+        b = {"ref": [], "form": defaultdict(list), "transl": defaultdict(list),
              "notes": [], "word": [], "word_gls": [], "morph": [], "morph_gls": []}
         for u in units_sub:
-            s_id = new_id()
-            b["phono"].append((s_id, ts_id(u["ts1"]), ts_id(u["ts2"]),
-                               _form_text(u["forms"], main_form.get("kind", ""))))
-            for fm in extra_forms:
+            # The time-aligned tier is the sentence/reference tier; its value is
+            # the <S>/<W> id.  Every transcription FORM is a reference child.
+            ref_id = new_id()
+            b["ref"].append((ref_id, ts_id(u["ts1"]), ts_id(u["ts2"]), u.get("id", "")))
+
+            has_breakdown = bool(u["morphs"] if is_wordlist else u["words"])
+            primary_id = None
+            for i, fm in enumerate(forms):
                 txt = _form_text(u["forms"], fm.get("kind", ""))
-                if txt:
-                    b["extra"][fm["tier"]].append((new_id(), s_id, None, txt))
+                # always emit the primary form when it must anchor a word/morph
+                # breakdown; emit any form when it has text.
+                if txt or (i == 0 and has_breakdown):
+                    aid = new_id()
+                    b["form"][fm["tier"]].append((aid, ref_id, None, txt))
+                    if i == 0:
+                        primary_id = aid
+
             for lang, text in u["transl"]:
                 if text:
-                    b["transl"][lang].append((new_id(), s_id, None, text))
+                    b["transl"][lang].append((new_id(), ref_id, None, text))
+
             if cfg.get("notes_tier"):
                 prev = None
                 for note in u["notes"]:
-                    aid = new_id(); b["notes"].append((aid, s_id, prev, note)); prev = aid
+                    aid = new_id(); b["notes"].append((aid, ref_id, prev, note)); prev = aid
+
+            # words/morphemes hang under the primary transcription (as in the
+            # source EAFs); fall back to ref only if there is no primary form.
+            anchor = primary_id if primary_id is not None else ref_id
 
             def add_morphs(parent_id, morphs):
                 if not cfg.get("morph_tier"):
@@ -468,12 +494,12 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
                         b["morph_gls"].append((new_id(), mid, None, m["gloss"]))
 
             if is_wordlist:
-                add_morphs(s_id, u["morphs"])
+                add_morphs(anchor, u["morphs"])
             elif cfg.get("word_tier"):
                 prev_w = None
                 for w in u["words"]:
                     w_id = new_id()
-                    b["word"].append((w_id, s_id, prev_w, w["form"])); prev_w = w_id
+                    b["word"].append((w_id, anchor, prev_w, w["form"])); prev_w = w_id
                     if cfg.get("word_gls_tier") and w["gls"]:
                         b["word_gls"].append((new_id(), w_id, None, w["gls"]))
                     add_morphs(w_id, w["morphs"])
@@ -556,27 +582,34 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
         part = who or None
         def nm(base):
             return base + suffix
-        phono_name = nm(main_form["tier"])
-        write_alignable(phono_name, b["phono"], lang_ref=object_lang or None, participant=part)
-        for fm in extra_forms:
-            if b["extra"].get(fm["tier"]):
-                write_ref(nm(fm["tier"]), "symassoc", phono_name,
-                          b["extra"][fm["tier"]], participant=part)
+        ref_tier = nm(ref_name)
+        primary_tier = nm(primary["tier"])
+        # time-aligned reference (sentence/entry) tier
+        write_alignable(ref_tier, b["ref"], participant=part)
+        # transcription forms — all reference children of ref; object language
+        # goes on the primary transcription.
+        for i, fm in enumerate(forms):
+            anns = b["form"].get(fm["tier"])
+            if anns:
+                write_ref(nm(fm["tier"]), "symassoc", ref_tier, anns,
+                          lang_ref=(object_lang or None) if i == 0 else None,
+                          participant=part)
         for lang, tname in (cfg.get("transl_tiers") or {}).items():
             if b["transl"][lang]:
-                write_ref(nm(tname), "symassoc", phono_name, b["transl"][lang],
+                write_ref(nm(tname), "symassoc", ref_tier, b["transl"][lang],
                           lang_ref=lang or None, participant=part)
         if cfg.get("notes_tier") and b["notes"]:
-            write_ref(nm(cfg["notes_tier"]), "symsub", phono_name, b["notes"], participant=part)
+            write_ref(nm(cfg["notes_tier"]), "symsub", ref_tier, b["notes"], participant=part)
+        # words/morphemes hang under the primary transcription
         if is_wordlist:
             if cfg.get("morph_tier") and b["morph"]:
-                write_ref(nm(cfg["morph_tier"]), "symsub", phono_name, b["morph"], participant=part)
+                write_ref(nm(cfg["morph_tier"]), "symsub", primary_tier, b["morph"], participant=part)
                 if cfg.get("morph_gls_tier") and b["morph_gls"]:
                     write_ref(nm(cfg["morph_gls_tier"]), "symassoc",
                               nm(cfg["morph_tier"]), b["morph_gls"], participant=part)
         elif cfg.get("word_tier") and b["word"]:
             word_name = nm(cfg["word_tier"])
-            write_ref(word_name, "symsub", phono_name, b["word"], participant=part)
+            write_ref(word_name, "symsub", primary_tier, b["word"], participant=part)
             if cfg.get("word_gls_tier") and b["word_gls"]:
                 write_ref(nm(cfg["word_gls_tier"]), "symassoc", word_name,
                           b["word_gls"], participant=part)

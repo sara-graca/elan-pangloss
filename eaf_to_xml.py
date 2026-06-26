@@ -752,16 +752,6 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
             allow_back=True
         )
 
-    def step_word_form_visible(state):
-        # Global setting, asked once (idx 0) right after the word tier is chosen.
-        s = _spk(state)
-        if s.get("_mirrored") or not s.get("word_form"):
-            return _NOASK
-        state["word_form_visible"] = _yesno(
-            "Show the word form in the output?  [XML: <W><FORM>]", True,
-            allow_back=True
-        )
-
     def step_morph(state):
         s = _spk(state)
         if s.get("_mirrored"):
@@ -836,8 +826,6 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
     if not is_wordlist:
         # A wordlist entry IS the word — no separate word tier, no nested <W>.
         steps += [(p + "word_form", step_word), (p + "word_gls", step_word_gls)]
-        if idx == 0:
-            steps += [(p + "word_form_visible", step_word_form_visible)]
     steps += [
         (p + "morph_form", step_morph), (p + "morph_gls", step_morph_gls),
         (p + "morph_gls_lang", step_morph_gls_lang),
@@ -1025,10 +1013,6 @@ def interactive_config(tier_map, annotations, stem, directory_mode=False):
         "text_id":           state.get("text_id") if not directory_mode else None,
         "doctype":           state.get("doctype", "text"),
         "object_lang":       state.get("object_lang", ""),
-        "word_form_visible": state.get(
-            "word_form_visible",
-            any(sp.get("word_form") for sp in state.get("speakers", []))
-        ),
         "speakers":          [],
     }
     for sp in state.get("speakers", []):
@@ -1087,7 +1071,6 @@ def _show_config_summary(cfg):
     if cfg.get("text_id"):
         print(f"  Identifier     : {cfg.get('text_id')}")
     print(f"  Object lang    : {cfg.get('object_lang')}")
-    print(f"  Word form shown: {cfg.get('word_form_visible')}")
     for spk in cfg.get("speakers") or []:
         label = f"Speaker {spk['who']}" if spk.get("who") else "Speaker"
         print(f"\n  {label}  (segment tier: {spk['segment_tier']})")
@@ -1339,7 +1322,6 @@ def write_xml(segments, cfg, out_path):
     lang    = cfg.get("object_lang", "")
     text_id = cfg.get("text_id", "text")
     doctype = cfg.get("doctype", "text")
-    word_form_visible = cfg.get("word_form_visible", True)
 
     is_wordlist = (doctype == "wordlist")
     root_tag = "WORDLIST" if is_wordlist else "TEXT"
@@ -1406,13 +1388,13 @@ def write_xml(segments, cfg, out_path):
                     lines.append("        </M>")
         else:
             for w in s["words"]:
-                has_form = word_form_visible and w["form"]
+                has_form = bool(w["form"])
                 # Keep a word if it shows a form/gloss OR groups at least one
                 # morpheme; only words with nothing at all are dropped.
                 if not (has_form or w["gls"] or w["morphs"]):
                     continue
                 lines.append("        <W>")
-                if word_form_visible and w["form"]:
+                if w["form"]:
                     lines.append(f'            <FORM>{_esc(w["form"])}</FORM>')
                 if w["gls"]:
                     lines.append(f'            <TRANSL>{_esc(w["gls"])}</TRANSL>')
@@ -1695,7 +1677,7 @@ def process_directory(eaf_dir, output_dir, config=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert ELAN .eaf to Pangloss XML.",
+        description="Convert ELAN .eaf to Pangloss/Cocoon XML.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
