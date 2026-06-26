@@ -20,7 +20,7 @@ Convert a whole directory with saved configs:
     python xml_to_eaf.py input_dir/ output_dir/ --config my.json
     python xml_to_eaf.py input_dir/ output_dir/ --config configs_folder/
 
-    Config reuse for directories
+Config reuse for directories
 ----------------------------
 --config can be a single JSON file (used for every file) or a FOLDER of configs.
 With a folder, each EAF is matched to the config whose tiers it actually has
@@ -29,19 +29,6 @@ mapping before converting. One config can cover every file from the same
 template; add more for the multispeaker or wordlist variants. Files no config
 fits are set up interactively and saved into the folder; unused configs are
 ignored.
-
-Config reuse for directories
-----------------------------
---config can be a single JSON file (used for every file) or a FOLDER of configs.
- When it is a folder, each XML is matched to a config by content chape: 
- the converter picks the config that can represent everything the file contains, 
-shows the proposed file->config mapping for you to confirm or adjust, and converts.  
-Files no config fits are set up interactively and saved into the folder; 
-unused configs are ignored.
-
-Both TEXT and WORDLIST documents are supported.  Multi-speaker documents (units
-carrying who="…") are split onto per-speaker tiers ("tx@SP1", "tx@SP2", …) with
-the PARTICIPANT attribute set.
 
 Config format (JSON)
 --------------------
