@@ -1,9 +1,10 @@
+#!/usr/bin/env python3
 """
-eaf_to_xml.py — Convert ELAN .eaf files to the Pangloss XML format.
+eaf_to_xml.py — Convert ELAN .eaf files to the Pangloss/Cocoon XML format.
 
 Usage
 -----
-Inspect tier structure:
+Inspect tier structure (always a good first step):
     python eaf_to_xml.py input.eaf --inspect
 
 Convert a single file (interactive):
@@ -21,18 +22,26 @@ Convert a whole directory with a saved config:
 
 Config reuse for directories
 ----------------------------
---config can be a single JSON file (used for every file) or a FOLDER of configs.
-With a folder, each EAF is matched to the config whose tiers it actually has
-(the most specific one if several fit). You confirm the proposed file->config
-mapping before converting. One config can cover every file from the same
-template; add more for the multispeaker or wordlist variants. Files no config
-fits are set up interactively and saved into the folder; unused configs are
-ignored.
+--config may point to a single JSON file (one mapping applied to every file
+whose tiers match) OR to a FOLDER of configs.  When it is a folder, each EAF is
+matched to a config by TIER STRUCTURE — the converter picks the config whose
+referenced tiers all exist in that file (the most specific one when several
+fit), shows the proposed file->config mapping for you to confirm or adjust, and
+converts.  So one config can serve every file built from the same template,
+with extra configs for the multispeaker or wordlist variants.  Files with no
+compatible config are configured interactively (and saved into that folder);
+configs that match nothing are ignored.
 
 Interactive navigation
 -----------------------
-Type < (or "back") at a prompt to return to the previous question. 
-Press Enter to accept a suggestion (required field) or skip (optional field).
+At most prompts you can type  <  (or "back") to return to the previous
+question if you made a mistake.  Press Enter to accept a suggestion on a
+*required* field, or to *skip* an optional field.
+
+Config format
+-------------
+Configs are saved as JSON.  A config describes one or more speakers, each with
+their own tier mapping.
 """
 
 import sys
@@ -328,11 +337,7 @@ def detect_segment_tiers(tier_map, annotations):
          at least one child tier (standalone annotation tracks have 0 children).
       2. Group by speaker (PARTICIPANT, then @SPx suffix).
       3. Within each speaker group, keep only the candidate with the most
-         child tiers — that is almost always the main segment tier.
-
-    Assumption: at most ONE segment tier per speaker (the richest is kept).  A
-    file that legitimately has two parallel root tiers for the same speaker
-    would need them picked manually.
+         child tiers.
     """
     child_tier_count = defaultdict(int)
     for tier in tier_map.values():
@@ -1196,7 +1201,7 @@ def build_segments(annotations, children, tier_map, cfg):
         pos_sep  = spk.get("morph_pos_sep", "")
 
         for mid in collect_descendants(parent_id, mtid, children, annotations):
-            m_val = annotations[mid]["value"].strip()
+            m_val = annotations[mid]["value"].strip().strip("-")
 
             if pos_tid:
                 for pid in collect_descendants(mid, pos_tid, children, annotations):
@@ -1209,7 +1214,7 @@ def build_segments(annotations, children, tier_map, cfg):
             if gtid:
                 for gid in collect_descendants(mid, gtid, children, annotations):
                     if annotations[gid]["value"]:
-                        gloss = annotations[gid]["value"].strip()
+                        gloss = annotations[gid]["value"].strip().strip("-")
                         break
 
             morphs.append({"form": m_val, "gloss": gloss, "gloss_lang": gls_lang})

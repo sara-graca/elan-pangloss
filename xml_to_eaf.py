@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 xml_to_eaf.py — Convert Pangloss/Cocoon XML files to ELAN .eaf format.
 
@@ -22,17 +23,30 @@ Convert a whole directory with saved configs:
 Config reuse for directories
 ----------------------------
 --config can be a single JSON file (used for every file) or a FOLDER of configs.
-With a folder, each EAF is matched to the config whose tiers it actually has
-(the most specific one if several fit). You confirm the proposed file->config
-mapping before converting. One config can cover every file from the same
-template; add more for the multispeaker or wordlist variants. Files no config
-fits are set up interactively and saved into the folder; unused configs are
-ignored.
+With a folder, each XML is matched to the config that can represent its content
+(the most fitting one if several do). You confirm the proposed file->config
+mapping before converting. One config can cover every file of the same shape;
+add more for the wordlist or multi-translation variants. Files no config fits
+are set up interactively and saved into the folder; unused configs are ignored.
 
 Tier structure produced
 -----------------------
+The time-aligned (ALIGNABLE) tier is the sentence/reference tier, holding the
+<S>/<W> id.  Every transcription <FORM> becomes a reference tier beneath it
+(Symbolic_Association), so multiple equally-ranked transcriptions are supported
+and none has to be "the" aligned one.  This mirrors the source EAFs, where the
+ref tier is time-aligned and the transcription hangs off it.  Words/morphemes
+attach under the first ("primary") transcription, as in the originals.
+
+A unit may carry several <FORM> lines, each with its own kindOf (phono, ortho,
+phone, …) or none; you choose a tier name for each.
+
 Both TEXT and WORDLIST documents are supported.  Multi-speaker documents (units
 with who="…") are split onto per-speaker tiers ("ref@SP1", "tx@SP1", …).
+
+Note: the Pangloss XML only stores generic ids (S1, S2, …); the original ref
+codes are not present in the XML, so the rebuilt reference tier carries those
+generic ids.
 
 Config format (JSON)
 --------------------
@@ -47,6 +61,8 @@ Config format (JSON)
   "morph_tier"    : "mb",
   "morph_gls_tier": "ge_m"
 }
+"ref_tier" is the time-aligned tier; the first entry of "forms" is the primary
+transcription (words/morphemes attach there).
 """
 
 import sys
@@ -237,7 +253,7 @@ def _default_form_name(kind, used):
 
 
 def _form_label(kind, idx):
-    role = "Transcription"
+    role = "Transcription (primary)" if idx == 0 else "Transcription"
     return f"{role} ({kind or 'no kindOf'})"
 
 
@@ -448,19 +464,25 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
     forms = cfg.get("forms") or [{"kind": "", "tier": "tx"}]
     primary = forms[0]
     ref_name = cfg.get("ref_tier") or "ref"
+    # When the reference tier and the primary transcription are the same tier,
+    # the time-aligned tier *holds* the transcription (e.g. some source EAFs have
+    # no separate ref tier); we then carry the form text on the ref tier itself.
+    ref_is_primary = (ref_name == primary["tier"])
 
     def collect(units_sub):
         b = {"ref": [], "form": defaultdict(list), "transl": defaultdict(list),
              "notes": [], "word": [], "word_gls": [], "morph": [], "morph_gls": []}
         for u in units_sub:
-            # The time-aligned tier is the sentence/reference tier; its value is
-            # the <S>/<W> id.  Every transcription FORM is a reference child.
             ref_id = new_id()
-            b["ref"].append((ref_id, ts_id(u["ts1"]), ts_id(u["ts2"]), u.get("id", "")))
+            ref_val = (_form_text(u["forms"], primary.get("kind", ""))
+                       if ref_is_primary else u.get("id", ""))
+            b["ref"].append((ref_id, ts_id(u["ts1"]), ts_id(u["ts2"]), ref_val))
 
             has_breakdown = bool(u["morphs"] if is_wordlist else u["words"])
-            primary_id = None
+            primary_id = ref_id if ref_is_primary else None
             for i, fm in enumerate(forms):
+                if ref_is_primary and i == 0:
+                    continue  # the ref tier already carries the primary form
                 txt = _form_text(u["forms"], fm.get("kind", ""))
                 # always emit the primary form when it must anchor a word/morph
                 # breakdown; emit any form when it has text.
@@ -584,11 +606,16 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
             return base + suffix
         ref_tier = nm(ref_name)
         primary_tier = nm(primary["tier"])
-        # time-aligned reference (sentence/entry) tier
-        write_alignable(ref_tier, b["ref"], participant=part)
-        # transcription forms — all reference children of ref; object language
-        # goes on the primary transcription.
+        # time-aligned reference tier; if it itself carries the transcription,
+        # the object language goes here.
+        write_alignable(ref_tier, b["ref"],
+                        lang_ref=(object_lang or None) if ref_is_primary else None,
+                        participant=part)
+        # transcription forms — reference children of ref; object language on the
+        # primary transcription (unless the ref tier already is it).
         for i, fm in enumerate(forms):
+            if ref_is_primary and i == 0:
+                continue  # already written as the ref tier
             anns = b["form"].get(fm["tier"])
             if anns:
                 write_ref(nm(fm["tier"]), "symassoc", ref_tier, anns,
@@ -862,8 +889,25 @@ def process_directory(xml_dir, output_dir, config=None):
     if cfg_path and cfg_path.is_file():
         with open(cfg_path, encoding="utf-8-sig") as fh:
             cfg = json.load(fh)
-        print(f"\nConverting {len(xml_paths)} file(s)...")
+        skipped, to_process = [], []
         for path in xml_paths:
+            try:
+                _, _, is_wordlist, _, units = parse_xml(str(path))
+            except Exception as e:
+                print(f"  Could not read {path.name}: {e}", file=sys.stderr)
+                skipped.append(path)
+                continue
+            if _config_covers(cfg, _content_flags(units, is_wordlist), is_wordlist):
+                to_process.append(path)
+            else:
+                skipped.append(path)
+        if skipped:
+            print(f"\nSkipping {len(skipped)} file(s) — config can't represent "
+                  f"their content shape:")
+            for path in skipped:
+                print(f"  {path.name}")
+        print(f"\nConverting {len(to_process)} file(s)...")
+        for path in to_process:
             _convert_one(path, cfg, output_dir)
         return
 
@@ -903,12 +947,13 @@ def main():
         return
 
     text_id, object_lang, is_wordlist, soundfile, units = parse_xml(str(input_path))
-    inspect_xml(text_id, object_lang, is_wordlist, soundfile, units)
 
-    if args.inspect or not args.output:
-        if not args.inspect:
-            parser.error("output file is required unless --inspect is given")
+    if args.inspect:
+        inspect_xml(text_id, object_lang, is_wordlist, soundfile, units)
         return
+
+    if not args.output:
+        parser.error("output file is required unless --inspect is given")
 
     if args.config:
         cfg_path = Path(args.config)
