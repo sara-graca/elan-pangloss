@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-xml_to_eaf.py — Convert Pangloss/Cocoon XML files to ELAN .eaf format.
+xml_to_eaf.py — Convert Pangloss/Cocoon XML files to the ELAN .eaf format.
 
 Usage
 -----
@@ -9,9 +9,11 @@ Inspect what's in a Pangloss XML file:
 
 Convert a single file (interactive):
     python xml_to_eaf.py input.xml output.eaf
+    python xml_to_eaf.py input.xml output_dir/
 
 Reuse a saved configuration:
     python xml_to_eaf.py input.xml output.eaf --config my.json
+    python xml_to_eaf.py input.xml output_dir/ --config my.json
 
 Convert a whole directory (interactive):
     python xml_to_eaf.py input_dir/ output_dir/
@@ -20,49 +22,36 @@ Convert a whole directory with saved configs:
     python xml_to_eaf.py input_dir/ output_dir/ --config my.json
     python xml_to_eaf.py input_dir/ output_dir/ --config configs_folder/
 
+Single-file output
+------------------
+The second argument may be an .eaf FILE name, or a FOLDER.  
+When it is a folder, the EAF is written into it under the XML's own
+name with a .eaf extension (input.xml -> output_dir/input.eaf).
+
 Config reuse for directories
 ----------------------------
 --config can be a single JSON file (used for every file) or a FOLDER of configs.
-With a folder, each XML is matched to the config that can represent its content
-(the most fitting one if several do). You confirm the proposed file->config
-mapping before converting. One config can cover every file of the same shape;
-add more for the wordlist or multi-translation variants. Files no config fits
-are set up interactively and saved into the folder; unused configs are ignored.
+With a folder, each XML is matched to the config that can represent its content. 
+You confirm the proposed file->config mapping before converting. 
+Files no config fits are set up interactively; unused configs are ignored.
 
 Tier structure produced
 -----------------------
-The time-aligned (ALIGNABLE) tier is the sentence/reference tier, holding the
-<S>/<W> id.  Every transcription <FORM> becomes a reference tier beneath it
-(Symbolic_Association), so multiple equally-ranked transcriptions are supported
-and none has to be "the" aligned one.  This mirrors the source EAFs, where the
-ref tier is time-aligned and the transcription hangs off it.  Words/morphemes
-attach under the first ("primary") transcription, as in the originals.
+The reference tier is time-aligned and holds the <S>/<W> id. Each transcription
+(<FORM>) becomes its own tier underneath it. If a unit has several FORM lines
+(e.g. phono, ortho, phone), you name a separate tier for each. Words and
+morphemes attach under the primary transcription tier.
 
-A unit may carry several <FORM> lines, each with its own kindOf (phono, ortho,
-phone, …) or none; you choose a tier name for each.
+Both TEXT and WORDLIST documents work. If a document has multiple speakers
+(units with who="..."), every tier is duplicated per speaker, e.g. "ref@SP1"
+and "ref@SP2" instead of just "ref".
 
-Both TEXT and WORDLIST documents are supported.  Multi-speaker documents (units
-with who="…") are split onto per-speaker tiers ("ref@SP1", "tx@SP1", …).
-
-Note: the Pangloss XML only stores generic ids (S1, S2, …); the original ref
-codes are not present in the XML, so the rebuilt reference tier carries those
-generic ids.
-
-Config format (JSON)
---------------------
-{
-  "ref_tier"      : "ref",
-  "forms"         : [{"kind": "phono", "tier": "tx"},
-                     {"kind": "ortho", "tier": "ortho"}],
-  "transl_tiers"  : {"fr": "ft"},
-  "notes_tier"    : "notes",
-  "word_tier"     : "word",
-  "word_gls_tier" : "ge_w",
-  "morph_tier"    : "mb",
-  "morph_gls_tier": "ge_m"
-}
-"ref_tier" is the time-aligned tier; the first entry of "forms" is the primary
-transcription (words/morphemes attach there).
+Tier types
+----------------
+By default each tier gets its own LINGUISTIC_TYPE named after the tier (its base
+name, without the @SPx suffix): the reference tier uses a time-alignable type,
+transcriptions/translations/glosses use Symbolic_Association, words/morphemes use 
+Symbolic_Subdivision.  After choosing tier names you may optionally rename these types.
 """
 
 import sys
@@ -70,6 +59,7 @@ import json
 import argparse
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from functools import lru_cache
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -79,7 +69,7 @@ _AUDIO_MIME = {"wav": "audio/x-wav", "mp3": "audio/mpeg", "flac": "audio/x-flac"
                "m4a": "audio/mp4"}
 
 
-# --- Helpers ---
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def sec_to_ms(s):
     try:
@@ -94,10 +84,16 @@ def _esc_attr(text):
     return _esc(text).replace('"', "&quot;")
 
 
-# --- Parse Pangloss XML ---
+@lru_cache(maxsize=32)
+def _parse_xml_root(path):
+    """Parse an XML file once per run; grouping, matching and conversion share it."""
+    return ET.parse(path).getroot()
+
+
+# ─── Parse Pangloss XML ──────────────────────────────────────────────────────
 
 def parse_xml(path):
-    root = ET.parse(path).getroot()
+    root = _parse_xml_root(str(path))
     is_wordlist = (root.tag == "WORDLIST")
     unit_tag = "W" if is_wordlist else "S"
 
@@ -153,6 +149,28 @@ def parse_xml(path):
             unit["words"] = words
         units.append(unit)
 
+    # never drop content silently: count what this importer does not carry
+    ignored = defaultdict(int)
+    for u_elem in root.findall(unit_tag):
+        for w_elem in u_elem.findall("W") if not is_wordlist else []:
+            ignored["word-level NOTE"] += len(w_elem.findall("NOTE"))
+            ignored["extra word FORM"] += max(0, len(w_elem.findall("FORM")) - 1)
+            ignored["extra word TRANSL"] += max(0, len(w_elem.findall("TRANSL")) - 1)
+            for m_elem in w_elem.findall("M"):
+                ignored["morpheme-level NOTE"] += len(m_elem.findall("NOTE"))
+                ignored["extra morpheme FORM"] += max(0, len(m_elem.findall("FORM")) - 1)
+                ignored["extra morpheme TRANSL"] += max(0, len(m_elem.findall("TRANSL")) - 1)
+        for m_elem in u_elem.findall("M") if is_wordlist else []:
+            ignored["morpheme-level NOTE"] += len(m_elem.findall("NOTE"))
+            ignored["extra morpheme FORM"] += max(0, len(m_elem.findall("FORM")) - 1)
+            ignored["extra morpheme TRANSL"] += max(0, len(m_elem.findall("TRANSL")) - 1)
+    ignored = {k: n for k, n in ignored.items() if n}
+    if ignored:
+        detail = ", ".join(f"{n} {k}(s)" for k, n in sorted(ignored.items()))
+        print(f"  WARNING {Path(path).name}: the following XML content is not "
+              f"imported and will be absent from the EAF: {detail}.",
+              file=sys.stderr)
+
     return text_id, object_lang, is_wordlist, soundfile, units
 
 
@@ -165,7 +183,7 @@ def _form_text(unit_forms, kind):
     return ""
 
 
-# --- Content flags ---
+# ─── Content flags ───────────────────────────────────────────────────────────
 
 def _content_flags(units, is_wordlist):
     form_kinds = []
@@ -200,7 +218,68 @@ def _structure_signature(is_wordlist, flags):
             flags["has_morphs"], flags["has_m_gls"], tuple(sorted(flags["speakers"])))
 
 
-# --- Inspect ---
+# ─── Tier roles / linguistic types ───────────────────────────────────────────
+
+# The ELAN constraint each role's LINGUISTIC_TYPE must carry:
+#   None                     -> time-alignable root (the reference tier)
+#   "Symbolic_Association"   -> 1-1 child (transcriptions, translations, glosses)
+#   "Symbolic_Subdivision"   -> ordered children (words, morphemes)
+
+def _config_tiers_with_constraints(cfg, is_wordlist):
+    """
+    Yield (tier_name, constraint) for every tier this config will create, in the
+    order they appear in the EAF.  Speaker @SPx suffixes are NOT included — types
+    are shared across speakers, exactly like the tier base names.
+    """
+    forms = cfg.get("forms") or [{"kind": "", "tier": "tx"}]
+    primary = forms[0]
+    ref_name = cfg.get("ref_tier") or "ref"
+    ref_is_primary = (ref_name == primary["tier"])
+
+    out = [(ref_name, None)]
+    for i, fm in enumerate(forms):
+        if ref_is_primary and i == 0:
+            continue
+        out.append((fm["tier"], "Symbolic_Association"))
+    for tname in (cfg.get("transl_tiers") or {}).values():
+        out.append((tname, "Symbolic_Association"))
+    if cfg.get("notes_tier"):
+        out.append((cfg["notes_tier"], "Symbolic_Subdivision"))
+    if is_wordlist:
+        if cfg.get("morph_tier"):
+            out.append((cfg["morph_tier"], "Symbolic_Subdivision"))
+            if cfg.get("morph_gls_tier"):
+                out.append((cfg["morph_gls_tier"], "Symbolic_Association"))
+    else:
+        if cfg.get("word_tier"):
+            out.append((cfg["word_tier"], "Symbolic_Subdivision"))
+            if cfg.get("word_gls_tier"):
+                out.append((cfg["word_gls_tier"], "Symbolic_Association"))
+            if cfg.get("morph_tier"):
+                out.append((cfg["morph_tier"], "Symbolic_Subdivision"))
+                if cfg.get("morph_gls_tier"):
+                    out.append((cfg["morph_gls_tier"], "Symbolic_Association"))
+    # de-duplicate while keeping order (a tier name maps to one type)
+    seen, uniq = set(), []
+    for name, constraint in out:
+        if name in seen:
+            continue
+        seen.add(name)
+        uniq.append((name, constraint))
+    return uniq
+
+
+def _default_types(cfg, is_wordlist):
+    """Standard mapping: each tier's type == the tier name."""
+    return {name: name for name, _ in _config_tiers_with_constraints(cfg, is_wordlist)}
+
+
+def _type_of(cfg, tier_name, is_wordlist):
+    """Type to use for a given tier (base name)."""
+    return (cfg.get("types") or {}).get(tier_name, tier_name)
+
+
+# ─── Inspect ─────────────────────────────────────────────────────────────────
 
 def inspect_xml(text_id, object_lang, is_wordlist, soundfile, units):
     f = _content_flags(units, is_wordlist)
@@ -229,7 +308,7 @@ def inspect_xml(text_id, object_lang, is_wordlist, soundfile, units):
     print()
 
 
-# --- Interactive config ---
+# ─── Interactive config ──────────────────────────────────────────────────────
 
 def _ask(prompt, default=""):
     suffix = f"\n  (press Enter to use \"{default}\")" if default else ""
@@ -257,24 +336,31 @@ def _form_label(kind, idx):
     return f"{role} ({kind or 'no kindOf'})"
 
 
-def _show_summary(cfg):
+def _show_summary(cfg, is_wordlist=False):
     print()
     print("=" * 60)
     print("Summary of your choices")
     print("=" * 60)
-    print(f"  Sentence/reference tier         : {cfg.get('ref_tier') or 'ref'}"
+    print(f"  Segment/reference tier         : {cfg.get('ref_tier') or 'ref'}"
           f"  (time-aligned)")
     for idx, fm in enumerate(cfg.get("forms") or []):
         print(f"  {_form_label(fm.get('kind',''), idx):34s}: {fm['tier']}")
     for lang, tname in (cfg.get("transl_tiers") or {}).items():
         label = lang if lang else "(no lang code)"
-        print(f"  Translation ({label:8s})       : {tname}")
+        print(f"  Translation ({label})                  : {tname}")
     def opt(k): return cfg.get(k) or "(none)"
     print(f"  Notes tier                      : {opt('notes_tier')}")
     print(f"  Word tier                       : {opt('word_tier')}")
     print(f"  Word gloss tier                 : {opt('word_gls_tier')}")
     print(f"  Morpheme tier                   : {opt('morph_tier')}")
     print(f"  Morpheme gloss tier             : {opt('morph_gls_tier')}")
+    if cfg.get("types"):
+        pairs = _config_tiers_with_constraints(cfg, is_wordlist)
+        renamed = ", ".join(f"{name} -> {_type_of(cfg, name, is_wordlist)}"
+                            for name, _ in pairs
+                            if _type_of(cfg, name, is_wordlist) != name)
+        print(f"  Linguistic types                : "
+              f"{renamed if renamed else 'same as tier names'}")
     print()
 
 
@@ -303,12 +389,30 @@ def _predefined_cfg(is_wordlist, f):
     }
 
 
+def _speaker_suffix_note(f):
+    """
+    When the document has 2+ speakers, print (once, during tier naming) why each
+    tier name will be duplicated per speaker and suffixed "@<speaker>".  The
+    suffixes are the real who= codes from the XML, whatever they are.
+    """
+    spk = f.get("speakers") or []
+    if len(spk) < 2:
+        return
+    suffixes = ", ".join(f"@{w}" for w in spk)
+    print(f"NOTE: This document has {len(spk)} speakers ({', '.join(spk)}).")
+    print(f"      Every tier below is created once per speaker:")
+    print(f"      the names become {suffixes} versions "
+          f"(tx -> {', '.join('tx'+s for s in ('@'+w for w in spk))}).")
+    print()
+
+
 def _show_predefined(is_wordlist, f):
     cfg = _predefined_cfg(is_wordlist, f)
     print()
     print("Standard tier names:")
     print()
-    print(f"  {cfg['ref_tier']:8s}  {'Sentence / reference id':32s}  "
+    _speaker_suffix_note(f)
+    print(f"  {cfg['ref_tier']:8s}  {'Utterance id':32s}  "
           f"[XML: <S id> / <W id>]  (time-aligned)")
     for idx, fm in enumerate(cfg["forms"]):
         xml = "<FORM>" if idx == 0 and not fm["kind"] else f"<FORM kindOf='{fm['kind']}'>"
@@ -328,7 +432,7 @@ def _show_predefined(is_wordlist, f):
 def _custom_cfg(is_wordlist, f):
     has_words = f["has_words"] and not is_wordlist
     while True:
-        cfg = {"ref_tier": _ask("Sentence/reference tier name (time-aligned)", "ref")}
+        cfg = {"ref_tier": _ask("Segment/reference tier name (time-aligned)", "ref")}
         used = set()
         forms = []
         for idx, kind in enumerate(f["form_kinds"]):
@@ -354,13 +458,56 @@ def _custom_cfg(is_wordlist, f):
             _ask("Morpheme gloss tier name", "ge_m" if both_gls else "ge")
             if f["has_m_gls"] and cfg["morph_tier"] else None)
 
-        _show_summary(cfg)
+        _show_summary(cfg, is_wordlist)
         if _yesno("Does this look correct?", True):
             return cfg
         print("\nStarting over — please re-enter your choices.\n")
 
 
-def interactive_config(is_wordlist, units, save=True):
+def _show_predefined_types(cfg, is_wordlist):
+    print()
+    print("Standard linguistic types (one per tier, named after the tier):")
+    print()
+    label = {None: "time-aligned", "Symbolic_Association": "Symbolic_Association",
+             "Symbolic_Subdivision": "Symbolic_Subdivision"}
+    for name, constraint in _config_tiers_with_constraints(cfg, is_wordlist):
+        print(f"  tier {name:12s}  ->  type {name:12s}  ({label[constraint]})")
+    print()
+
+
+def _custom_types(cfg, is_wordlist):
+    """Let the user rename each linguistic type; constraints stay fixed by role."""
+    pairs = _config_tiers_with_constraints(cfg, is_wordlist)
+    while True:
+        types = {}
+        for name, _constraint in pairs:
+            types[name] = _ask(f"Type for tier '{name}'", name)
+        cfg["types"] = types
+        _show_summary(cfg, is_wordlist)
+        if _yesno("Does this look correct?", True):
+            return types
+        print("\nStarting over — please re-enter the types.\n")
+
+
+def _choose_types(cfg, is_wordlist):
+    """Optional step: choose the LINGUISTIC_TYPE for the chosen tiers."""
+    if not _yesno("\nDo you also want to choose the tier TYPES "
+                  "(LINGUISTIC_TYPE)?", False):
+        return  # leave cfg["types"] unset -> tier type == tier name
+    _show_predefined_types(cfg, is_wordlist)
+    choice = input(
+        "Use these standard types, or choose custom ones? "
+        "[standard / custom]: ").strip().lower()
+    if choice in ("s", "standard", ""):
+        cfg["types"] = _default_types(cfg, is_wordlist)
+        _show_summary(cfg, is_wordlist)
+        if _yesno("Does this look correct?", True):
+            return
+        print("\nSwitching to custom types.\n")
+    _custom_types(cfg, is_wordlist)
+
+
+def interactive_config(is_wordlist, units, save=True, stem=None):
     f = _content_flags(units, is_wordlist)
     _show_predefined(is_wordlist, f)
     choice = input(
@@ -370,7 +517,7 @@ def interactive_config(is_wordlist, units, save=True):
     cfg = None
     if choice in ("s", "standard", ""):
         cfg = _predefined_cfg(is_wordlist, f)
-        _show_summary(cfg)
+        _show_summary(cfg, is_wordlist)
         if not _yesno("Does this look correct?", True):
             print("\nSwitching to custom names.\n")
             cfg = None
@@ -381,12 +528,14 @@ def interactive_config(is_wordlist, units, save=True):
         print("Choose a name for each tier that will be created in the EAF.\n")
         cfg = _custom_cfg(is_wordlist, f)
 
+    _choose_types(cfg, is_wordlist)
+
     if save:
-        _save_cfg_interactive(cfg)
+        _save_config_interactive(cfg, stem)
     return cfg
 
 
-# --- Config saving (crash-safe) ---
+# ─── Config saving (crash-safe) ──────────────────────────────────────────────
 
 def _write_config(cfg, path):
     try:
@@ -403,14 +552,31 @@ def _write_config(cfg, path):
         return False
 
 
-def _save_cfg_interactive(cfg):
+def _save_config_interactive(cfg, stem=None):
+    """
+    Prompt for a save path and retry on failure so selections survive.
+
+    When `stem` is given (the input file's name), typing 'y' saves to
+    "<stem>.json" without having to type the name out.
+    """
+    auto = f"{stem}.json" if stem else None
     while True:
-        save_path = input(
-            "\nSave these choices to reuse next time?\n"
-            "(file name ending in .json, or Enter to skip): "
-        ).strip()
+        if auto:
+            prompt = (
+                "\nSave these choices to reuse next time?\n"
+                f"(type 'y' for \"{auto}\", another file name ending in .json, "
+                "or Enter to skip): "
+            )
+        else:
+            prompt = (
+                "\nSave these choices to reuse next time?\n"
+                "(file name ending in .json, or Enter to skip): "
+            )
+        save_path = input(prompt).strip()
         if not save_path:
             return
+        if auto and save_path.lower() in ("y", "yes"):
+            save_path = auto
         if _write_config(cfg, save_path):
             return
 
@@ -444,7 +610,7 @@ def _save_configs_per_file_interactive(configs):
             return
 
 
-# --- Build EAF ---
+# ─── Build EAF ───────────────────────────────────────────────────────────────
 
 def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
     _ann = [0]
@@ -456,10 +622,23 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
         return f"a{_ann[0]}"
 
     def ts_id(ms):
+        # one TIME_SLOT per boundary (no dedup): even when two annotations meet
+        # at the same millisecond they get separate slots, so a linguist can
+        # later move one boundary in ELAN without dragging the other with it.
         _ts[0] += 1
         tsid = f"ts{_ts[0]}"
         ts_slots.append((tsid, ms))
         return tsid
+
+    # A Pangloss text without <AUDIO> timing would put every sentence on a
+    # zero-length interval at 0:00 — unusable in ELAN.  Synthesize consecutive
+    # 1-second placeholder spans instead (and say so).
+    if units and all(not u["ts1"] and not u["ts2"] for u in units):
+        for i, u in enumerate(units):
+            u["ts1"], u["ts2"] = i * 1000, (i + 1) * 1000
+        print("  WARNING: no <AUDIO> timing in the XML — using placeholder "
+              "times (1 s per unit); re-align in ELAN if needed.",
+              file=sys.stderr)
 
     forms = cfg.get("forms") or [{"kind": "", "tier": "tx"}]
     primary = forms[0]
@@ -531,9 +710,13 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
     if len(distinct) <= 1:
         groups = [("", distinct[0] if distinct else "", units)]
     else:
+
         groups = [(f"@{w}", w, [u for u in units if u["who"] == w]) for w in distinct]
         empties = [u for u in units if not u["who"]]
         if empties:
+            print(f"  Note: {len(empties)} unit(s) have no who= and go on "
+                  f"un-suffixed tiers alongside the per-speaker ones.",
+                  file=sys.stderr)
             groups.append(("", "", empties))
 
     speaker_blocks = [(suffix, who, collect(sub)) for suffix, who, sub in groups]
@@ -560,11 +743,14 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
         lines.append(f'        <TIME_SLOT TIME_SLOT_ID="{tsid}" TIME_VALUE="{ms}"/>')
     lines.append('    </TIME_ORDER>')
 
+    def lt_of(tier_base):
+        return _type_of(cfg, tier_base, is_wordlist)
+
     def tier_header(tier_id, ltype, parent=None, lang_ref=None, participant=None):
         attrs = ""
         if lang_ref:
             attrs += f' LANG_REF="{_esc_attr(lang_ref)}"'
-        attrs += f' LINGUISTIC_TYPE_REF="{ltype}"'
+        attrs += f' LINGUISTIC_TYPE_REF="{_esc_attr(ltype)}"'
         if parent:
             attrs += f' PARENT_REF="{_esc_attr(parent)}"'
         if participant:
@@ -572,8 +758,8 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
         attrs += f' TIER_ID="{_esc_attr(tier_id)}"'
         return f'    <TIER{attrs}>'
 
-    def write_alignable(tier_id, anns, lang_ref=None, participant=None):
-        lines.append(tier_header(tier_id, "default-lt", lang_ref=lang_ref, participant=participant))
+    def write_alignable(tier_id, ltype, anns, lang_ref=None, participant=None):
+        lines.append(tier_header(tier_id, ltype, lang_ref=lang_ref, participant=participant))
         for aid, ts1, ts2, value in anns:
             lines.extend([
                 '        <ANNOTATION>',
@@ -608,7 +794,7 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
         primary_tier = nm(primary["tier"])
         # time-aligned reference tier; if it itself carries the transcription,
         # the object language goes here.
-        write_alignable(ref_tier, b["ref"],
+        write_alignable(ref_tier, lt_of(ref_name), b["ref"],
                         lang_ref=(object_lang or None) if ref_is_primary else None,
                         participant=part)
         # transcription forms — reference children of ref; object language on the
@@ -618,44 +804,57 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
                 continue  # already written as the ref tier
             anns = b["form"].get(fm["tier"])
             if anns:
-                write_ref(nm(fm["tier"]), "symassoc", ref_tier, anns,
+                write_ref(nm(fm["tier"]), lt_of(fm["tier"]), ref_tier, anns,
                           lang_ref=(object_lang or None) if i == 0 else None,
                           participant=part)
         for lang, tname in (cfg.get("transl_tiers") or {}).items():
             if b["transl"][lang]:
-                write_ref(nm(tname), "symassoc", ref_tier, b["transl"][lang],
+                write_ref(nm(tname), lt_of(tname), ref_tier, b["transl"][lang],
                           lang_ref=lang or None, participant=part)
         if cfg.get("notes_tier") and b["notes"]:
-            write_ref(nm(cfg["notes_tier"]), "symsub", ref_tier, b["notes"], participant=part)
+            write_ref(nm(cfg["notes_tier"]), lt_of(cfg["notes_tier"]), ref_tier,
+                      b["notes"], participant=part)
         # words/morphemes hang under the primary transcription
         if is_wordlist:
             if cfg.get("morph_tier") and b["morph"]:
-                write_ref(nm(cfg["morph_tier"]), "symsub", primary_tier, b["morph"], participant=part)
+                write_ref(nm(cfg["morph_tier"]), lt_of(cfg["morph_tier"]), primary_tier,
+                          b["morph"], participant=part)
                 if cfg.get("morph_gls_tier") and b["morph_gls"]:
-                    write_ref(nm(cfg["morph_gls_tier"]), "symassoc",
+                    write_ref(nm(cfg["morph_gls_tier"]), lt_of(cfg["morph_gls_tier"]),
                               nm(cfg["morph_tier"]), b["morph_gls"], participant=part)
         elif cfg.get("word_tier") and b["word"]:
             word_name = nm(cfg["word_tier"])
-            write_ref(word_name, "symsub", primary_tier, b["word"], participant=part)
+            write_ref(word_name, lt_of(cfg["word_tier"]), primary_tier, b["word"],
+                      participant=part)
             if cfg.get("word_gls_tier") and b["word_gls"]:
-                write_ref(nm(cfg["word_gls_tier"]), "symassoc", word_name,
-                          b["word_gls"], participant=part)
+                write_ref(nm(cfg["word_gls_tier"]), lt_of(cfg["word_gls_tier"]),
+                          word_name, b["word_gls"], participant=part)
             if cfg.get("morph_tier") and b["morph"]:
-                write_ref(nm(cfg["morph_tier"]), "symsub", word_name, b["morph"], participant=part)
+                write_ref(nm(cfg["morph_tier"]), lt_of(cfg["morph_tier"]), word_name,
+                          b["morph"], participant=part)
                 if cfg.get("morph_gls_tier") and b["morph_gls"]:
-                    write_ref(nm(cfg["morph_gls_tier"]), "symassoc",
+                    write_ref(nm(cfg["morph_gls_tier"]), lt_of(cfg["morph_gls_tier"]),
                               nm(cfg["morph_tier"]), b["morph_gls"], participant=part)
 
-    lines.extend([
-        '    <LINGUISTIC_TYPE GRAPHIC_REFERENCES="false"'
-        ' LINGUISTIC_TYPE_ID="default-lt" TIME_ALIGNABLE="true"/>',
-        '    <LINGUISTIC_TYPE CONSTRAINTS="Symbolic_Association"'
-        ' GRAPHIC_REFERENCES="false" LINGUISTIC_TYPE_ID="symassoc"'
-        ' TIME_ALIGNABLE="false"/>',
-        '    <LINGUISTIC_TYPE CONSTRAINTS="Symbolic_Subdivision"'
-        ' GRAPHIC_REFERENCES="false" LINGUISTIC_TYPE_ID="symsub"'
-        ' TIME_ALIGNABLE="false"/>',
-    ])
+    # ── LINGUISTIC_TYPE block: one per distinct type actually used ────────────
+    emitted = []
+    seen_types = set()
+    for tier_base, constraint in _config_tiers_with_constraints(cfg, is_wordlist):
+        tname = lt_of(tier_base)
+        if tname in seen_types:
+            continue
+        seen_types.add(tname)
+        emitted.append((tname, constraint))
+    for tname, constraint in emitted:
+        if constraint is None:
+            lines.append(
+                f'    <LINGUISTIC_TYPE GRAPHIC_REFERENCES="false"'
+                f' LINGUISTIC_TYPE_ID="{_esc_attr(tname)}" TIME_ALIGNABLE="true"/>')
+        else:
+            lines.append(
+                f'    <LINGUISTIC_TYPE CONSTRAINTS="{constraint}"'
+                f' GRAPHIC_REFERENCES="false" LINGUISTIC_TYPE_ID="{_esc_attr(tname)}"'
+                f' TIME_ALIGNABLE="false"/>')
 
     lang_codes = []
     if object_lang:
@@ -684,7 +883,7 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
     return "\n".join(lines) + "\n"
 
 
-# --- Directory mode ---
+# ─── Directory mode ──────────────────────────────────────────────────────────
 
 def _convert_one(path, cfg, output_dir):
     text_id, object_lang, is_wordlist, soundfile, units = parse_xml(str(path))
@@ -773,6 +972,36 @@ def _config_covers(cfg, flags, is_wordlist):
     return True
 
 
+def _warn_uncovered(cfg, flags, is_wordlist, name):
+    """
+    Print exactly what content of one file the config cannot represent (and
+    would therefore be dropped).  Returns True if anything is uncovered.
+    """
+    problems = []
+    missing_kinds = set(flags["form_kinds"]) - _config_form_kinds(cfg)
+    if missing_kinds:
+        problems.append("FORM kind(s) " + ", ".join(repr(k or "(no label)")
+                                                    for k in sorted(missing_kinds)))
+    missing_langs = set(flags["transl_langs"]) - set((cfg.get("transl_tiers") or {}).keys())
+    if missing_langs:
+        problems.append("translation language(s) "
+                        + ", ".join(repr(l or "(no lang)") for l in sorted(missing_langs)))
+    if flags["has_notes"] and not cfg.get("notes_tier"):
+        problems.append("NOTEs (no notes tier configured)")
+    if not is_wordlist and flags["has_words"] and not cfg.get("word_tier"):
+        problems.append("words (no word tier configured)")
+    if flags["has_w_gls"] and not cfg.get("word_gls_tier"):
+        problems.append("word glosses (no word-gloss tier configured)")
+    if flags["has_morphs"] and not cfg.get("morph_tier"):
+        problems.append("morphemes (no morpheme tier configured)")
+    if flags["has_m_gls"] and not cfg.get("morph_gls_tier"):
+        problems.append("morpheme glosses (no morpheme-gloss tier configured)")
+    if problems:
+        print(f"  WARNING {name}: this config drops content present in the "
+              f"file: " + "; ".join(problems) + ".", file=sys.stderr)
+    return bool(problems)
+
+
 def _config_specificity(cfg, flags, is_wordlist):
     optional = [
         ("notes_tier", flags["has_notes"]),
@@ -803,9 +1032,11 @@ def _propose_matches(xml_paths, folder_configs):
         if not compatible:
             unmatched.append(path)
             continue
+        # A config named after the file wins outright (same rule as eaf_to_xml);
+        # otherwise the most specific compatible config wins.
         compatible.sort(
-            key=lambda t: (_config_specificity(t[1], flags, is_wordlist),
-                           path.stem == t[0]),
+            key=lambda t: (path.stem == t[0],
+                           _config_specificity(t[1], flags, is_wordlist)),
             reverse=True)
         mapping[path] = compatible[0]
     return mapping, unmatched
@@ -861,13 +1092,18 @@ def _convert_with_config_folder(xml_paths, output_dir, config_dir):
                 _convert_one(path, mapping[path][1], output_dir)
 
     if unmatched:
-        print(f"\n{len(unmatched)} file(s) need a new config — let's set them up.")
-        new_configs = _interactive_configs(unmatched)
-        _save_configs_per_file(new_configs, config_dir)
-        print(f"\nConverting {len(unmatched)} newly-configured file(s)...")
-        for cfg, paths in new_configs:
-            for path in paths:
-                _convert_one(path, cfg, output_dir)
+        print(f"\n{len(unmatched)} file(s) have no matching config in the folder:")
+        for path in unmatched:
+            print(f"  {path.name}")
+        if _yesno("Configure these by hand? (n = skip them)", False):
+            new_configs = _interactive_configs(unmatched)
+            _save_configs_per_file(new_configs, config_dir)
+            print(f"\nConverting {len(unmatched)} newly-configured file(s)...")
+            for cfg, paths in new_configs:
+                for path in paths:
+                    _convert_one(path, cfg, output_dir)
+        else:
+            print(f"Skipping {len(unmatched)} unmatched file(s).")
 
 
 def process_directory(xml_dir, output_dir, config=None):
@@ -900,15 +1136,30 @@ def process_directory(xml_dir, output_dir, config=None):
             if _config_covers(cfg, _content_flags(units, is_wordlist), is_wordlist):
                 to_process.append(path)
             else:
+                _warn_uncovered(cfg, _content_flags(units, is_wordlist),
+                                is_wordlist, path.name)
                 skipped.append(path)
         if skipped:
-            print(f"\nSkipping {len(skipped)} file(s) — config can't represent "
-                  f"their content shape:")
+            print(f"\n{len(skipped)} file(s) don't match the config "
+                  f"'{cfg_path.name}':")
             for path in skipped:
                 print(f"  {path.name}")
-        print(f"\nConverting {len(to_process)} file(s)...")
+            hand = _yesno("Configure these by hand? (n = skip them)", False)
+        else:
+            hand = False
+
+        print(f"\nConverting {len(to_process)} file(s) with '{cfg_path.name}'...")
         for path in to_process:
             _convert_one(path, cfg, output_dir)
+
+        if hand:
+            print(f"\nConfiguring {len(skipped)} remaining file(s) by hand "
+                  f"(grouped by content shape)...")
+            extra = _interactive_configs(skipped)
+            _save_configs_per_file_interactive(extra)
+            for extra_cfg, paths in extra:
+                for path in paths:
+                    _convert_one(path, extra_cfg, output_dir)
         return
 
     print(f"Scanning {len(xml_paths)} XML file(s)...")
@@ -920,7 +1171,39 @@ def process_directory(xml_dir, output_dir, config=None):
             _convert_one(path, cfg, output_dir)
 
 
-# --- Entry point ---
+# ─── Single-file output resolution ───────────────────────────────────────────
+
+def _resolve_single_output(output_arg, input_path):
+    """
+    Resolve the output argument for single-file mode.
+
+    The argument may be an .eaf FILE name or a FOLDER:
+      - An existing directory, or a path ending in a path separator, is treated
+        as a folder; the EAF is written into it as "<xml stem>.eaf".
+      - A path with no extension that is not an existing file is also treated as
+        a folder (created on demand), for convenience.
+      - Otherwise it is treated as a file path and used as-is.
+
+    Returns the resolved output file Path.  Folders are created on demand, so
+    the caller can always open the returned path for writing.
+    """
+    out = Path(output_arg)
+    ends_with_sep = output_arg.endswith(("/", "\\"))
+
+    is_folder = (
+        out.is_dir()
+        or ends_with_sep
+        or (out.suffix == "" and not out.is_file())
+    )
+
+    if is_folder:
+        out.mkdir(parents=True, exist_ok=True)
+        return out / (input_path.stem + ".eaf")
+
+    return out
+
+
+# ─── Entry point ─────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
@@ -930,7 +1213,8 @@ def main():
     )
     parser.add_argument("input",  help="Input XML file or directory of XML files")
     parser.add_argument("output", nargs="?",
-                        help="Output .eaf file (single) or output directory (batch)")
+                        help="Output .eaf file or a folder (single), or output "
+                             "directory (batch)")
     parser.add_argument("--inspect", action="store_true",
                         help="Show contents and exit (single file only)")
     parser.add_argument("--config", metavar="PATH",
@@ -953,7 +1237,15 @@ def main():
         return
 
     if not args.output:
-        parser.error("output file is required unless --inspect is given")
+        parser.error("output file or folder is required unless --inspect is given")
+
+    # Resolve the output path up front — BEFORE the interview — so a folder
+    # target becomes "<folder>/<xml stem>.eaf" now, never an IsADirectoryError
+    # after the user has answered every prompt.
+    out_path = _resolve_single_output(args.output, input_path)
+    if out_path.suffix.lower() != ".eaf":
+        print(f"  Note: output '{out_path}' does not end in .eaf (possible typo?) "
+              f"— writing there anyway.", file=sys.stderr)
 
     if args.config:
         cfg_path = Path(args.config)
@@ -965,14 +1257,16 @@ def main():
             cfg_path = match
         with open(cfg_path, encoding="utf-8-sig") as fh:
             cfg = json.load(fh)
+        _warn_uncovered(cfg, _content_flags(units, is_wordlist), is_wordlist,
+                        input_path.name)
     else:
-        cfg = interactive_config(is_wordlist, units)
+        cfg = interactive_config(is_wordlist, units, stem=input_path.stem)
 
     eaf_content = build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg)
-    with open(args.output, "w", encoding="utf-8") as fh:
+    with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(eaf_content)
     kind = "word" if is_wordlist else "sentence"
-    print(f"Written {len(units)} {kind}(s) to {args.output}")
+    print(f"Written {len(units)} {kind}(s) to {out_path}")
 
 
 if __name__ == "__main__":

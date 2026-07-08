@@ -4,44 +4,36 @@ eaf_to_xml.py — Convert ELAN .eaf files to the Pangloss/Cocoon XML format.
 
 Usage
 -----
-Inspect tier structure (always a good first step):
+Inspect tier structure:
     python eaf_to_xml.py input.eaf --inspect
 
 Convert a single file (interactive):
     python eaf_to_xml.py input.eaf output.xml
+    python eaf_to_xml.py input.eaf output_dir/
 
-Reuse a saved configuration:
+Convert a single file with a saved configuration:
     python eaf_to_xml.py input.eaf output.xml --config my.json
+    python eaf_to_xml.py input.eaf output_dir/ --config my.json
 
 Convert a whole directory (interactive):
     python eaf_to_xml.py input_dir/ output_dir/
 
-Convert a whole directory with a saved config:
+Convert a whole directory with a saved configuration:
     python eaf_to_xml.py input_dir/ output_dir/ --config my.json
     python eaf_to_xml.py input_dir/ output_dir/ --config configs_folder/
 
+Single-file output
+------------------
+The second argument may be an .xml FILE name, or a FOLDER.  
+When it is a folder, the XML is written into it under the EAF's own
+name with a .xml extension (input.eaf -> output_dir/input.xml).
+
 Config reuse for directories
 ----------------------------
---config may point to a single JSON file (one mapping applied to every file
-whose tiers match) OR to a FOLDER of configs.  When it is a folder, each EAF is
-matched to a config by TIER STRUCTURE — the converter picks the config whose
-referenced tiers all exist in that file (the most specific one when several
-fit), shows the proposed file->config mapping for you to confirm or adjust, and
-converts.  So one config can serve every file built from the same template,
-with extra configs for the multispeaker or wordlist variants.  Files with no
-compatible config are configured interactively (and saved into that folder);
-configs that match nothing are ignored.
-
-Interactive navigation
------------------------
-At most prompts you can type  <  (or "back") to return to the previous
-question if you made a mistake.  Press Enter to accept a suggestion on a
-*required* field, or to *skip* an optional field.
-
-Config format
--------------
-Configs are saved as JSON.  A config describes one or more speakers, each with
-their own tier mapping.
+--config can be a single JSON file (used for every file) or a FOLDER of configs.
+With a folder, each XML is matched to the config that can represent its content. 
+You confirm the proposed file->config mapping before converting. 
+Files no config fits are set up interactively; unused configs are ignored.
 """
 
 import sys
@@ -49,7 +41,8 @@ import json
 import argparse
 import re
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from collections import defaultdict, deque
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -66,6 +59,12 @@ def _esc_attr(text):
     return _esc(text).replace('"', "&quot;")
 
 
+@lru_cache(maxsize=32)
+def _parse_root(path):
+    """Parse an EAF once per run; parse_eaf and media_basenames share the tree."""
+    return ET.parse(path).getroot()
+
+
 # ─── Parse EAF ────────────────────────────────────────────────────────────────
 
 def parse_eaf(path):
@@ -76,8 +75,7 @@ def parse_eaf(path):
     tier_map    : dict  tier_id → tier Element
     linguistic_types : dict  lt_id → {CONSTRAINTS}
     """
-    tree = ET.parse(path)
-    root = tree.getroot()
+    root = _parse_root(str(path))
 
     time_slots = {}
     for ts in root.findall(".//TIME_SLOT"):
@@ -227,9 +225,9 @@ def collect_descendants(ann_id, target_tier_id, children, annotations):
     BFS from ann_id; collect descendants whose tier_id == target_tier_id.
     """
     result = []
-    queue = list(children.get(ann_id, []))
+    queue = deque(children.get(ann_id, []))
     while queue:
-        cid = queue.pop(0)
+        cid = queue.popleft()
         if annotations[cid]["tier_id"] == target_tier_id:
             result.append(cid)
         else:
@@ -271,7 +269,7 @@ def media_basenames(path):
     Prefers RELATIVE_MEDIA_URL, falls back to MEDIA_URL.
     """
     try:
-        root = ET.parse(path).getroot()
+        root = _parse_root(str(path))
     except ET.ParseError:
         return []
     audio_ext = ("wav", "mp3", "flac", "ogg", "aif", "aiff", "m4a")
@@ -337,7 +335,11 @@ def detect_segment_tiers(tier_map, annotations):
          at least one child tier (standalone annotation tracks have 0 children).
       2. Group by speaker (PARTICIPANT, then @SPx suffix).
       3. Within each speaker group, keep only the candidate with the most
-         child tiers.
+         child tiers — that is almost always the main segment tier.
+
+    Assumption: at most ONE segment tier per speaker (the richest is kept).  A
+    file that legitimately has two parallel root tiers for the same speaker
+    would need them picked manually.
     """
     child_tier_count = defaultdict(int)
     for tier in tier_map.values():
@@ -408,7 +410,7 @@ def _pick_one(prompt, tier_ids, required=False, default=None, allow_back=False):
 
         parts = []
         if required and default:
-            parts.append(f'Enter for "{default}"')
+            parts.append(f'Type \'y\' for "{default}"')
             parts.append("Select a number/name")
         elif required:
             parts.append("Select a number/name")
@@ -428,15 +430,14 @@ def _pick_one(prompt, tier_ids, required=False, default=None, allow_back=False):
             raise _GoBack
 
         if not raw:
-            if required and default:
-                return default
             if required:
-                print("  This field is required — please make a selection.")
+                print("  This field is required — type 'y' to accept the "
+                      "suggestion, or pick a number/name.")
                 continue
             return None  # optional → Enter skips, even when a suggestion exists
 
         low = raw.lower()
-        if (not required) and default and low in ("y", "yes"):
+        if default and low in ("y", "yes"):
             return default
 
         if raw.isdigit():
@@ -451,43 +452,64 @@ def _pick_one(prompt, tier_ids, required=False, default=None, allow_back=False):
               f"(or Enter to skip).")
 
 
-def _pick_many(prompt, tier_ids, allow_back=False):
+def _pick_many(prompt, tier_ids, allow_back=False, defaults=(), required=False):
     print(f"\n{prompt}")
+    defaults = list(defaults)
     for i, tid in enumerate(tier_ids, 1):
-        print(f"  {i:3d}. {tid}")
-    raw = input("Your choices (comma-separated numbers/names "
-                "or Enter to skip): ").strip()
-    if allow_back and raw in _BACK_TOKENS:
-        raise _GoBack
-    if not raw:
-        return []
-    result = []
-    for token in raw.split(","):
-        token = token.strip()
-        if token.isdigit():
-            idx = int(token) - 1
-            if 0 <= idx < len(tier_ids):
-                result.append(tier_ids[idx])
+        mark = "  <- suggested" if tid in defaults else ""
+        print(f"  {i:3d}. {tid}{mark}")
+    if defaults and required:
+        hint = ("Your choices (Type 'y' for the suggested one(s) | "
+                "comma-separated numbers/names): ")
+    elif defaults:
+        hint = ("Your choices (Type 'y' for the suggested one(s) | "
+                "comma-separated numbers/names | Enter to skip): ")
+    elif required:
+        hint = "Your choices (comma-separated numbers/names): "
+    else:
+        hint = ("Your choices (comma-separated numbers/names "
+                "or Enter to skip): ")
+    while True:
+        raw = input(hint).strip()
+        if allow_back and raw in _BACK_TOKENS:
+            raise _GoBack
+        if not raw:
+            if required:
+                print("  This field is required — type 'y' to accept the "
+                      "suggestion, or pick number(s)/name(s).")
+                continue
+            return []
+        if defaults and raw.lower() in ("y", "yes"):
+            return list(defaults)
+        result = []
+        for token in raw.split(","):
+            token = token.strip()
+            if token.isdigit():
+                idx = int(token) - 1
+                if 0 <= idx < len(tier_ids):
+                    result.append(tier_ids[idx])
+                else:
+                    print(f"  Number {token} is out of range, skipping.")
+            elif token in tier_ids:
+                result.append(token)
             else:
-                print(f"  Number {token} is out of range, skipping.")
-        elif token in tier_ids:
-            result.append(token)
-        else:
-            print(f"  '{token}' does not match any tier name, skipping.")
-    return result
-
+                print(f"  '{token}' does not match any tier name, skipping.")
+        if result:
+            return result
+        if required:
+            print("  Nothing valid selected — please pick at least one.")
+            continue
+        return result
 
 def _ask_lang_required(ttid, auto):
     """Translation language is mandatory; Enter accepts the auto-detected code."""
+    hint = f"(Enter = \"{auto}\")" if auto else "(e.g. en, fr)"
     while True:
-        if auto:
-            raw = input(f"  Language code for the translation '{ttid}' "
-                        f"(Enter = \"{auto}\"): ").strip()
-            return raw if raw else auto
-        raw = input(f"  Language code for the translation '{ttid}' "
-                    f"(e.g. en, fr): ").strip()
+        raw = input(f"  Language code for the translation '{ttid}' {hint}: ").strip()
         if raw:
             return raw
+        if auto:
+            return auto
         print("  A language code is required for translations — please type one.")
 
 
@@ -498,18 +520,18 @@ def _tier_lang(tid, tier_map):
     return t.get("LANG_REF") or t.get("DEFAULT_LOCALE") or ""
 
 def _guess_lang(tid, tier_map):
-    """Tier LANG_REF/DEFAULT_LOCALE first, else 'en'/'fr' if the name contains it."""
+    """
+    Tier LANG_REF/DEFAULT_LOCALE first, else a code that appears as a separate
+    token in the tier name (e.g. 'A_phrase-gls-en' -> 'en').  Token-boundary
+    matching, so 'sentence' does not guess 'en' nor 'friction' 'fr'.
+    """
     lang = _tier_lang(tid, tier_map)
     if lang:
         return lang
-    low = (tid or "").lower()
-    if "en" in low:
-        return "en"
-    if "fr" in low:
-        return "fr"
-    return ""
+    m = re.search(r"(?:^|[-_@.])(en|fr|es|de|ru|zh)(?:$|[-_@.])", (tid or "").lower())
+    return m.group(1) if m else ""
 
-def _run_flow(build_steps, state):
+def _run_flow(build_steps, state, history=None, resume=False):
     """
     Drive a dynamically-built list of (label, fn) steps with back-navigation
     that spans the whole flow.
@@ -525,9 +547,14 @@ def _run_flow(build_steps, state):
       - anything else → the step asked the user; it is recorded.
     A step may raise _GoBack to jump to the previous *recorded* step.  Steps read
     state["_at_start"] to know whether a "go back" option is meaningful.
+
+    Passing the same `history` list back with resume=True re-enters the flow at
+    the last asked question (with all answers kept), so the whole interview can
+    be revisited after the summary.
     """
-    i = 0
-    history = []
+    if history is None:
+        history = []
+    i = history.pop() if (resume and history) else 0
     while True:
         steps = build_steps(state)
         if i >= len(steps):
@@ -539,6 +566,10 @@ def _run_flow(build_steps, state):
         except _GoBack:
             if history:
                 i = history.pop()
+                print("\n" + "↩ " * 20)
+                print("  Going back to the previous question — ignore the "
+                      "options listed above.")
+                print("↩ " * 20)
             else:
                 print("  (already at the first question — nothing to go back to)")
             continue
@@ -656,6 +687,15 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
     def _spk(state):
         return state["speakers"][idx]
 
+    def _skip_if_prefilled(fn):
+        """Skip a question when this speaker's mapping is already filled in
+        (accepted mirror or accepted fast-path proposal)."""
+        def wrapper(state):
+            if _spk(state).get("_prefilled"):
+                return _NOASK
+            return fn(state)
+        return wrapper
+
     def step_header(state):
         # Pure display; never recorded so it never traps "go back".
         if multi:
@@ -671,34 +711,42 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
         s    = _spk(state)
         prev = state["speakers"][idx - 1]
         transform = _derive_transform(prev["segment_tier"], s["segment_tier"])
-        mirrored  = _mirror_speaker(prev, s["segment_tier"], s["who"], tier_set, transform)
-        if not mirrored:
-            s["_mirrored"] = False
+        result    = _mirror_speaker(prev, s["segment_tier"], s["who"],
+                                    tier_set, transform)
+        if not result:
             return _NOASK
+        mirrored, dropped = result
         print(f"\n  '{s['segment_tier']}' looks like '{prev['segment_tier']}' with "
               f"only the speaker code changed.")
-        print(f"  Proposed mapping for speaker {s['who']} (mirrors {prev['who']}):")
+        print(f"  Proposed mapping for speaker {s['who']} (mirrors {prev['who']}):\n")
         _print_speaker_mapping(mirrored, indent="      ")
+        if dropped:
+            print(f"\n  WARNING: {len(dropped)} tier(s) from {prev['who']} have no "
+                  f"equivalent for {s['who']} and were left out:")
+            for label, missing in dropped:
+                print(f"      - {label}: '{missing}' (not in this file)")
+            print("  Everything else is mirrored; you can add the missing pieces "
+                  "by hand if you decline below.")
         if _yesno("  Re-use this mapping?", True, allow_back=True):
-            mirrored["_mirrored"] = True
+            mirrored["_prefilled"] = True
             state["speakers"][idx] = mirrored
         else:
-            s["_mirrored"] = False
+            state["speakers"][idx] = {"who": s["who"],
+                                      "segment_tier": s["segment_tier"]}
 
+    @_skip_if_prefilled
     def step_forms(state):
         s = _spk(state)
-        if s.get("_mirrored"):
-            return _NOASK
         seg = s["segment_tier"]
         tx_default = _best_tier(tier_ids, tier_map, ann_count, "tx",
                                 under=seg, include_under=True)
-        s["sentence"] = _pick_one(
+        tx = _pick_one(
             "Transcription tier  [XML: <FORM>]",
             tier_ids, required=True, default=tx_default, allow_back=True
         )
         kind = _ask("  Transcription type (e.g. phono, ortho, or Enter for none)  "
                     "[XML: <FORM kindOf='...'>]", "", allow_back=True)
-        forms = [{"tier": s["sentence"], "kind": kind or None}]
+        forms = [{"tier": tx, "kind": kind or None}]
         while _yesno("Add another transcription line?", False, allow_back=True):
             ft = _pick_one("  Transcription tier  [XML: <FORM>]", tier_ids, allow_back=True)
             if not ft:
@@ -708,32 +756,43 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
             forms.append({"tier": ft, "kind": fk or None})
         s["forms"] = forms
 
+    @_skip_if_prefilled
     def step_transl(state):
         s = _spk(state)
-        if s.get("_mirrored"):
-            return _NOASK
+        seg = s["segment_tier"]
+        # Auto-detect sentence-translation tiers: names/types that look like a
+        # free translation (ft, trad, translation, phrase-gls) sitting under this
+        # speaker's segment tier — excluding word/morpheme glosses and notes.
+        _T_POS = ("ft", "trad", "translation", "transl", "phrase-gls",
+                  "phrase-gloss")
+        _T_NEG = ("morph", "word-gls", "word-gloss", "mb", "-lit", "note",
+                  "segnum")
+        suggested = [
+            tid for tid in tier_ids
+            if any(k in _haystack(tid, tier_map) for k in _T_POS)
+            and not any(k in _haystack(tid, tier_map) for k in _T_NEG)
+            and _depth_under(tid, seg, tier_map) is not None
+        ]
         s["transl"] = _pick_many(
             "OPTIONAL — Translation tier(s)  [XML: <TRANSL xml:lang='...'>]",
-            tier_ids, allow_back=True
+            tier_ids, allow_back=True, defaults=suggested
         )
         langs = {}
         for ttid in s["transl"]:
             langs[ttid] = _ask_lang_required(ttid, _guess_lang(ttid, tier_map))
         s["transl_langs"] = langs
 
+    @_skip_if_prefilled
     def step_notes(state):
         s = _spk(state)
-        if s.get("_mirrored"):
-            return _NOASK
         s["notes"] = _pick_many(
             "OPTIONAL — Notes/comments tier(s)  [XML: <NOTE message='...'>]",
             tier_ids, allow_back=True
         )
 
+    @_skip_if_prefilled
     def step_word(state):
         s = _spk(state)
-        if s.get("_mirrored"):
-            return _NOASK
         s["word_form"] = _pick_one(
             "OPTIONAL — Word tier  [XML: <W><FORM>]",
             tier_ids,
@@ -744,9 +803,10 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
         if not s["word_form"]:
             s["word_gls"] = None
 
+    @_skip_if_prefilled
     def step_word_gls(state):
         s = _spk(state)
-        if s.get("_mirrored") or not s.get("word_form"):
+        if not s.get("word_form"):
             s.setdefault("word_gls", None)
             return _NOASK
         s["word_gls"] = _pick_one(
@@ -757,10 +817,9 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
             allow_back=True
         )
 
+    @_skip_if_prefilled
     def step_morph(state):
         s = _spk(state)
-        if s.get("_mirrored"):
-            return _NOASK
         # morphemes sit under the word tier when there is one, else under the
         # segment tier.
         under = s.get("word_form") or s["segment_tier"]
@@ -776,9 +835,10 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
             s["morph_pos"] = None
             s["morph_pos_sep"] = ""
 
+    @_skip_if_prefilled
     def step_morph_gls(state):
         s = _spk(state)
-        if s.get("_mirrored") or not s.get("morph_form"):
+        if not s.get("morph_form"):
             return _NOASK
         s["morph_gls"] = _pick_one(
             "OPTIONAL — Morpheme gloss tier  [XML: <M><TRANSL>]",
@@ -788,9 +848,10 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
             allow_back=True
         )
 
+    @_skip_if_prefilled
     def step_morph_gls_lang(state):
         s = _spk(state)
-        if s.get("_mirrored") or not s.get("morph_form") or not s.get("morph_gls"):
+        if not s.get("morph_form") or not s.get("morph_gls"):
             s.setdefault("morph_gls_lang", "")
             return _NOASK
         s["morph_gls_lang"] = _ask(
@@ -798,9 +859,10 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
             allow_back=True
         )
 
+    @_skip_if_prefilled
     def step_morph_pos(state):
         s = _spk(state)
-        if s.get("_mirrored") or not s.get("morph_form"):
+        if not s.get("morph_form"):
             return _NOASK
         s["morph_pos"] = _pick_one(
             "OPTIONAL — Part-of-speech tier (will be appended to each morpheme form)",
@@ -812,9 +874,10 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
         if not s["morph_pos"]:
             s["morph_pos_sep"] = ""
 
+    @_skip_if_prefilled
     def step_morph_pos_sep(state):
         s = _spk(state)
-        if s.get("_mirrored") or not s.get("morph_form") or not s.get("morph_pos"):
+        if not s.get("morph_form") or not s.get("morph_pos"):
             s.setdefault("morph_pos_sep", "")
             return _NOASK
         s["morph_pos_sep"] = _ask(
@@ -877,42 +940,89 @@ def _derive_transform(a, b):
 def _mirror_speaker(prev, seg2, who2, tier_set, transform):
     """
     Build a speaker config for `seg2` by applying `transform` to every tier
-    reference in `prev`.  Returns None if the transform doesn't reproduce the
-    segment tier or any mapped tier is missing from the file.
+    reference in `prev` — best effort.  Tiers whose mirrored name is absent from
+    the file are DROPPED (not fatal) and collected so the caller can warn.
+
+    Returns (config, dropped) where `dropped` is a list of (label, missing_tier),
+    or None only when the mirror is impossible in principle: the transform can't
+    reproduce the segment tier, or no transcription line survives (the mirror
+    would carry no content at all).
     """
     if transform is None or transform(prev["segment_tier"]) != seg2:
         return None
 
-    def m(t):
-        return transform(t) if t else t
+    dropped = []
+
+    def keep(label, t):
+        """Mirror one tier ref; None (and record) if the target is missing."""
+        if not t:
+            return t
+        mt = transform(t)
+        if mt in tier_set:
+            return mt
+        dropped.append((label, mt))
+        return None
+
+    forms = []
+    for fm in (prev.get("forms") or []):
+        t = fm.get("tier")
+        mt = transform(t) if t else t
+        if mt and mt not in tier_set:
+            dropped.append(("Transcription", mt))
+            continue
+        forms.append({"tier": mt, "kind": fm.get("kind")})
+
+    transl, transl_langs = [], {}
+    for t in (prev.get("transl") or []):
+        mt = transform(t)
+        if mt in tier_set:
+            transl.append(mt)
+            transl_langs[mt] = (prev.get("transl_langs") or {}).get(t, "")
+        else:
+            dropped.append(("Translation", mt))
+
+    notes = []
+    for t in (prev.get("notes") or []):
+        mt = transform(t)
+        if mt in tier_set:
+            notes.append(mt)
+        else:
+            dropped.append(("Notes", mt))
+
+    word_form = keep("Word", prev.get("word_form"))
+    # Word gloss depends on the word tier; if the word tier is gone it goes too.
+    word_gls = keep("Word gloss", prev.get("word_gls")) if word_form else None
+
+    morph_form = keep("Morpheme", prev.get("morph_form"))
+    if morph_form:
+        morph_gls      = keep("Morph gloss", prev.get("morph_gls"))
+        morph_gls_lang = prev.get("morph_gls_lang", "")
+        morph_pos      = keep("Morph PoS", prev.get("morph_pos"))
+        morph_pos_sep  = prev.get("morph_pos_sep", "") if morph_pos else ""
+    else:
+        morph_gls, morph_gls_lang = None, ""
+        morph_pos, morph_pos_sep  = None, ""
+
+    if not forms:
+        # Nothing to transcribe survived — the mirror would be empty.
+        return None
 
     new = {
         "who":            who2,
         "segment_tier":   seg2,
-        "sentence":       m(prev.get("sentence")),
-        "forms":          [{"tier": m(fm["tier"]), "kind": fm.get("kind")}
-                           for fm in (prev.get("forms") or [])],
-        "transl":         [m(t) for t in (prev.get("transl") or [])],
-        "transl_langs":   {m(t): (prev.get("transl_langs") or {}).get(t, "")
-                           for t in (prev.get("transl") or [])},
-        "notes":          [m(t) for t in (prev.get("notes") or [])],
-        "word_form":      m(prev.get("word_form")),
-        "word_gls":       m(prev.get("word_gls")),
-        "morph_form":     m(prev.get("morph_form")),
-        "morph_gls":      m(prev.get("morph_gls")),
-        "morph_gls_lang": prev.get("morph_gls_lang", ""),
-        "morph_pos":      m(prev.get("morph_pos")),
-        "morph_pos_sep":  prev.get("morph_pos_sep", ""),
+        "forms":          forms,
+        "transl":         transl,
+        "transl_langs":   transl_langs,
+        "notes":          notes,
+        "word_form":      word_form,
+        "word_gls":       word_gls,
+        "morph_form":     morph_form,
+        "morph_gls":      morph_gls,
+        "morph_gls_lang": morph_gls_lang,
+        "morph_pos":      morph_pos,
+        "morph_pos_sep":  morph_pos_sep,
     }
-
-    refs = [new["sentence"], new["word_form"], new["word_gls"],
-            new["morph_form"], new["morph_gls"], new["morph_pos"]]
-    refs += [fm["tier"] for fm in new["forms"]]
-    refs += new["transl"] + new["notes"]
-    for r in refs:
-        if r and r not in tier_set:
-            return None
-    return new
+    return new, dropped
 
 
 # ─── Interactive config builder ───────────────────────────────────────────────
@@ -936,7 +1046,8 @@ def interactive_config(tier_map, annotations, stem, directory_mode=False):
 
     # ── prefix steps ──────────────────────────────────────────────────────────
     def step_text_id(state):
-        state["text_id"] = _ask("Document identifier", stem)
+        tag = "WORDLIST" if state.get("doctype") == "wordlist" else "TEXT"
+        state["text_id"] = _ask(f"Document identifier  [{tag} id='...']", stem)
 
     def step_object_lang(state):
         while True:
@@ -965,31 +1076,25 @@ def interactive_config(tier_map, annotations, stem, directory_mode=False):
     def step_segment(state):
         ab = not state.get("_at_start")
         if auto_seg_tiers:
-            print("\nDetected segment tier(s) (these set timing, IDs and speakers):")
-            for t in auto_seg_tiers:
-                who = _speaker_key(t, tier_map) or "(single speaker)"
-                print(f"   - {t}   speaker={who}")
-            if _yesno("Use these?", True, allow_back=ab):
-                seg = list(auto_seg_tiers)
-            else:
-                seg = _pick_many(
-                    "Pick the segment tier(s) (one per speaker):", tier_ids
-                ) or list(auto_seg_tiers)
-                auto_spk   = {_speaker_key(t, tier_map) for t in auto_seg_tiers}
-                chosen_spk = {_speaker_key(t, tier_map) for t in seg}
-                missing = auto_spk - chosen_spk
-                if missing:
-                    print(f"\n  WARNING: detected speaker(s) not in your selection: "
-                          f"{', '.join(sorted(missing))}")
-                    print(  "  Their sentences will be absent from the output.")
+            unit = "W" if state.get("doctype") == "wordlist" else "S"
+            seg = _pick_many(
+                f"Segment tier(s) (these set timing; "
+                f"one per speaker)  [XML: <{unit}>]",
+                tier_ids, allow_back=ab, defaults=auto_seg_tiers, required=True
+            )
+            auto_spk   = {_speaker_key(t, tier_map) for t in auto_seg_tiers}
+            chosen_spk = {_speaker_key(t, tier_map) for t in seg}
+            missing = auto_spk - chosen_spk
+            if missing:
+                print(f"\n  WARNING: detected speaker(s) not in your selection: "
+                      f"{', '.join(sorted(missing))}")
+                print(  "  Their sentences will be absent from the output.")
         else:
             print("\nNo segment tiers were auto-detected.")
             seg = _pick_many(
-                "Pick the segment tier(s) manually (one per speaker):",
-                tier_ids, allow_back=ab
+                "REQUIRED — Segment tier(s) (one per speaker):",
+                tier_ids, allow_back=ab, required=True
             )
-            if not seg:
-                seg = [_pick_one("REQUIRED — Segment tier", tier_ids, required=True)]
         _set_seg_tiers(state, seg)
 
     # ── suffix steps ──────────────────────────────────────────────────────────
@@ -1011,34 +1116,46 @@ def interactive_config(tier_map, annotations, stem, directory_mode=False):
                                              is_wordlist=is_wl))
         return steps
 
-    state = _run_flow(build_steps, {})
+    history = []
+    state = _run_flow(build_steps, {}, history)
 
-    # ── assemble the config ───────────────────────────────────────────────────
-    cfg = {
-        "text_id":           state.get("text_id") if not directory_mode else None,
-        "doctype":           state.get("doctype", "text"),
-        "object_lang":       state.get("object_lang", ""),
-        "speakers":          [],
+    # ── assemble, summarize, and offer to go back and adjust ─────────────────
+    # one authoritative statement of what a speaker config contains
+    _SPK_DEFAULTS = {
+        "forms": [], "transl": [], "transl_langs": {}, "notes": [],
+        "word_form": None, "word_gls": None, "morph_form": None,
+        "morph_gls": None, "morph_gls_lang": "", "morph_pos": None,
+        "morph_pos_sep": "",
     }
-    for sp in state.get("speakers", []):
-        sp.pop("_mirrored", None)
-        sp.setdefault("forms", [{"tier": sp.get("sentence"), "kind": None}])
-        sp.setdefault("transl", [])
-        sp.setdefault("transl_langs", {})
-        sp.setdefault("notes", [])
-        sp.setdefault("word_form", None)
-        sp.setdefault("word_gls", None)
-        sp.setdefault("morph_form", None)
-        sp.setdefault("morph_gls", None)
-        sp.setdefault("morph_gls_lang", "")
-        sp.setdefault("morph_pos", None)
-        sp.setdefault("morph_pos_sep", "")
-        cfg["speakers"].append(sp)
 
-    _show_config_summary(cfg)
+    def _assemble():
+        # build the config from copies: `state` stays intact for re-entry
+        cfg = {
+            "text_id":     state.get("text_id") if not directory_mode else None,
+            "doctype":     state.get("doctype", "text"),
+            "object_lang": state.get("object_lang", ""),
+            "speakers":    [],
+        }
+        for sp in state.get("speakers", []):
+            sp = dict(sp)
+            sp.pop("_prefilled", None)
+            for k, v in _SPK_DEFAULTS.items():
+                sp.setdefault(k, type(v)() if isinstance(v, (list, dict)) else v)
+            cfg["speakers"].append(sp)
+        return cfg
+
+    while True:
+        cfg = _assemble()
+        unmapped = _show_config_summary(cfg, tier_map)
+        if unmapped and _yesno(
+                "Go back and adjust the mapping? (your answers are kept; "
+                "type '<' to move further back)", False):
+            state = _run_flow(build_steps, state, history, resume=True)
+            continue
+        break
 
     if not directory_mode:
-        _save_config_interactive(cfg)
+        _save_config_interactive(cfg, stem)
 
     return cfg
 
@@ -1067,7 +1184,7 @@ def _print_speaker_mapping(spk, indent="    "):
         print(f"{indent}{'Morph PoS':<13}: (none)")
 
 
-def _show_config_summary(cfg):
+def _show_config_summary(cfg, tier_map=None):
     print()
     print("=" * 60)
     print("Summary")
@@ -1080,7 +1197,15 @@ def _show_config_summary(cfg):
         label = f"Speaker {spk['who']}" if spk.get("who") else "Speaker"
         print(f"\n  {label}  (segment tier: {spk['segment_tier']})")
         _print_speaker_mapping(spk, indent="    ")
+    unmapped = []
+    if tier_map is not None:
+        unmapped = sorted(set(tier_map) - _config_tier_names(cfg))
+        if unmapped:
+            print(f"\n  Tiers NOT exported ({len(unmapped)}): "
+                  + ", ".join(unmapped))
+            print("  (their content will be absent from the XML)")
     print()
+    return unmapped
 
 
 # ─── Config saving (crash-safe) ────────────────────────────────────────────────
@@ -1102,15 +1227,31 @@ def _write_config(cfg, path):
         return False
 
 
-def _save_config_interactive(cfg):
-    """Prompt for a save path and retry on failure so selections survive."""
+def _save_config_interactive(cfg, stem=None):
+    """
+    Prompt for a save path and retry on failure so selections survive.
+
+    When `stem` is given (the input file's name), typing 'y' saves to
+    "<stem>.json" without having to type the name out.
+    """
+    auto = f"{stem}.json" if stem else None
     while True:
-        save_path = input(
-            "\nSave these choices to reuse next time?\n"
-            "(file name ending in .json, or Enter to skip): "
-        ).strip()
+        if auto:
+            prompt = (
+                "\nSave these choices to reuse next time?\n"
+                f"(type 'y' for \"{auto}\", another file name ending in .json, "
+                "or Enter to skip): "
+            )
+        else:
+            prompt = (
+                "\nSave these choices to reuse next time?\n"
+                "(file name ending in .json, or Enter to skip): "
+            )
+        save_path = input(prompt).strip()
         if not save_path:
             return
+        if auto and save_path.lower() in ("y", "yes"):
+            save_path = auto
         if _write_config(cfg, save_path):
             return
 
@@ -1201,7 +1342,7 @@ def build_segments(annotations, children, tier_map, cfg):
         pos_sep  = spk.get("morph_pos_sep", "")
 
         for mid in collect_descendants(parent_id, mtid, children, annotations):
-            m_val = annotations[mid]["value"].strip().strip("-")
+            m_val = annotations[mid]["value"].strip().strip("-=")
 
             if pos_tid:
                 for pid in collect_descendants(mid, pos_tid, children, annotations):
@@ -1214,7 +1355,7 @@ def build_segments(annotations, children, tier_map, cfg):
             if gtid:
                 for gid in collect_descendants(mid, gtid, children, annotations):
                     if annotations[gid]["value"]:
-                        gloss = annotations[gid]["value"].strip().strip("-")
+                        gloss = annotations[gid]["value"].strip().strip("-=")
                         break
 
             morphs.append({"form": m_val, "gloss": gloss, "gloss_lang": gls_lang})
@@ -1324,9 +1465,9 @@ def build_segments(annotations, children, tier_map, cfg):
 # ─── Write XML ────────────────────────────────────────────────────────────────
 
 def write_xml(segments, cfg, out_path):
-    lang    = cfg.get("object_lang", "")
-    text_id = cfg.get("text_id", "text")
-    doctype = cfg.get("doctype", "text")
+    lang    = cfg.get("object_lang") or ""
+    text_id = cfg.get("text_id") or "text"
+    doctype = cfg.get("doctype") or "text"
 
     is_wordlist = (doctype == "wordlist")
     root_tag = "WORDLIST" if is_wordlist else "TEXT"
@@ -1336,7 +1477,7 @@ def write_xml(segments, cfg, out_path):
         '<?xml version="1.0" encoding="utf-8"?>',
         f'<!DOCTYPE {root_tag} SYSTEM "https://cocoon.huma-num.fr/schemas/Archive.dtd">',
     ]
-    lang_attr = f' xml:lang="{lang}"' if lang else ""
+    lang_attr = f' xml:lang="{_esc_attr(lang)}"' if lang else ""
     lines.append(f'<{root_tag} id="{_esc_attr(text_id)}"{lang_attr}>')
     soundfile = cfg.get("_soundfile")
     if soundfile:
@@ -1362,18 +1503,18 @@ def write_xml(segments, cfg, out_path):
                 seq += 1
                 unit_id = f"{unit_tag}{seq}"
         used_ids.add(unit_id)
-        who_attr = f' who="{s["who"]}"' if s["who"] else ""
+        who_attr = f' who="{_esc_attr(s["who"])}"' if s["who"] else ""
         lines.append(f'    <{unit_tag} id="{_esc_attr(unit_id)}"{who_attr}>')
         lines.append(
             f'        <AUDIO start="{ms_to_sec(s["ts1"])}" end="{ms_to_sec(s["ts2"])}"/>'
         )
 
         for f in s["forms"]:
-            kattr = f' kindOf="{f["kind"]}"' if f.get("kind") else ""
+            kattr = f' kindOf="{_esc_attr(f["kind"])}"' if f.get("kind") else ""
             lines.append(f'        <FORM{kattr}>{_esc(f["text"])}</FORM>')
 
         for lang_key, text in s["transl"]:
-            la = f' xml:lang="{lang_key}"' if lang_key else ""
+            la = f' xml:lang="{_esc_attr(lang_key)}"' if lang_key else ""
             lines.append(f'        <TRANSL{la}>{_esc(text)}</TRANSL>')
 
         for note in s["notes"]:
@@ -1388,7 +1529,7 @@ def write_xml(segments, cfg, out_path):
                     if m["form"]:
                         lines.append(f'            <FORM>{_esc(m["form"])}</FORM>')
                     if m["gloss"]:
-                        gl = f' xml:lang="{m["gloss_lang"]}"' if m.get("gloss_lang") else ""
+                        gl = f' xml:lang="{_esc_attr(m["gloss_lang"])}"' if m.get("gloss_lang") else ""
                         lines.append(f'            <TRANSL{gl}>{_esc(m["gloss"])}</TRANSL>')
                     lines.append("        </M>")
         else:
@@ -1408,7 +1549,7 @@ def write_xml(segments, cfg, out_path):
                     if m["form"]:
                         lines.append(f'                <FORM>{_esc(m["form"])}</FORM>')
                     if m["gloss"]:
-                        gl = f' xml:lang="{m["gloss_lang"]}"' if m.get("gloss_lang") else ""
+                        gl = f' xml:lang="{_esc_attr(m["gloss_lang"])}"' if m.get("gloss_lang") else ""
                         lines.append(f'                <TRANSL{gl}>{_esc(m["gloss"])}</TRANSL>')
                     lines.append("            </M>")
                 lines.append("        </W>")
@@ -1613,13 +1754,18 @@ def _convert_with_config_folder(eaf_paths, output_dir, config_dir, dir_stem):
     # Configs that matched no file are simply never used → ignored.
 
     if unmatched:
-        print(f"\n{len(unmatched)} file(s) need a new config — let's set them up.")
-        new_configs = _interactive_configs(unmatched, dir_stem)
-        _save_configs_per_file(new_configs, config_dir)   # add to the same folder
-        print(f"\nConverting {len(unmatched)} newly-configured file(s)...")
-        for cfg, paths in new_configs:
-            for path in paths:
-                _convert_one(path, cfg, output_dir)
+        print(f"\n{len(unmatched)} file(s) have no matching config in the folder:")
+        for path in unmatched:
+            print(f"  {path.name}")
+        if _yesno("Configure these by hand? (n = skip them)", False):
+            new_configs = _interactive_configs(unmatched, dir_stem)
+            _save_configs_per_file(new_configs, config_dir)   # add to the same folder
+            print(f"\nConverting {len(unmatched)} newly-configured file(s)...")
+            for cfg, paths in new_configs:
+                for path in paths:
+                    _convert_one(path, cfg, output_dir)
+        else:
+            print(f"Skipping {len(unmatched)} unmatched file(s).")
 
 
 def process_directory(eaf_dir, output_dir, config=None):
@@ -1658,13 +1804,27 @@ def process_directory(eaf_dir, output_dir, config=None):
                 to_process.append(path)
 
         if skipped:
-            print(f"\nSkipping {len(skipped)} file(s) — tier mismatch with config:")
+            print(f"\n{len(skipped)} file(s) don't match the config "
+                  f"'{cfg_path.name}':")
             for path, missing in skipped:
                 print(f"  {path.name}: missing tier(s): {', '.join(sorted(missing))}")
+            hand = _yesno("Configure these by hand? (n = skip them)", False)
+        else:
+            hand = False
 
-        print(f"\nConverting {len(to_process)} file(s)...")
+        print(f"\nConverting {len(to_process)} file(s) with '{cfg_path.name}'...")
         for path in to_process:
             _convert_one(path, cfg, output_dir)
+
+        if hand:
+            mismatched = [path for path, _ in skipped]
+            print(f"\nConfiguring {len(mismatched)} remaining file(s) by hand "
+                  f"(grouped by tier structure)...")
+            extra = _interactive_configs(mismatched, dir_stem)
+            _save_configs_per_file_interactive(extra)
+            for extra_cfg, paths in extra:
+                for path in paths:
+                    _convert_one(path, extra_cfg, output_dir)
         return
 
     # ── No config: interview (grouped by structure), save per file, convert ────
@@ -1678,6 +1838,45 @@ def process_directory(eaf_dir, output_dir, config=None):
             _convert_one(path, cfg, output_dir)
 
 
+# ─── Single-file output resolution ─────────────────────────────────────────────
+
+def _resolve_single_output(output_arg, input_path):
+    """
+    Resolve the output argument for single-file mode.
+
+    The argument may be an .xml FILE name or a FOLDER:
+      - An existing directory, or a path ending in a path separator, is treated
+        as a folder; the XML is written into it as "<eaf stem>.xml".
+      - A path with no extension that is not an existing file is also treated as
+        a folder (created on demand), for convenience.
+      - Otherwise it is treated as a file path and used as-is.
+
+    Returns the resolved output file Path.  Exits with an error only when the
+    argument is ambiguous in a way that would otherwise crash on write (e.g. an
+    existing directory passed where a file was clearly intended is fine — we use
+    it as a folder — but an existing *file* with no .xml extension is accepted).
+    """
+    out = Path(output_arg)
+    ends_with_sep = output_arg.endswith(("/", "\\"))
+
+    is_folder = (
+        out.is_dir()
+        or ends_with_sep
+        or (out.suffix == "" and not out.is_file())
+    )
+
+    if is_folder:
+        out.mkdir(parents=True, exist_ok=True)
+        return out / (input_path.stem + ".xml")
+
+    # A plain file path: make sure it isn't secretly a directory.
+    if out.is_dir():  # unreachable given the branch above, kept for safety
+        out.mkdir(parents=True, exist_ok=True)
+        return out / (input_path.stem + ".xml")
+
+    return out
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main():
@@ -1688,7 +1887,8 @@ def main():
     )
     parser.add_argument("input",  help="Input .eaf file or directory of .eaf files")
     parser.add_argument("output", nargs="?",
-                        help="Output .xml file (single) or output directory (batch)")
+                        help="Output .xml file or a folder (single), or output "
+                             "directory (batch)")
     parser.add_argument("--inspect", action="store_true",
                         help="Print tier tree and exit (single file only)")
     parser.add_argument("--config", metavar="PATH",
@@ -1717,7 +1917,16 @@ def main():
         return
 
     if not args.output:
-        parser.error("output file is required unless --inspect is given")
+        parser.error("output file or folder is required unless --inspect is given")
+
+    # Resolve the output path up front — BEFORE the interview — so an
+    # ambiguous target (e.g. a folder passed where a file was expected) is
+    # turned into "<folder>/<eaf stem>.xml" or reported now, never after the
+    # user has answered every prompt.
+    out_path = _resolve_single_output(args.output, input_path)
+    if out_path.suffix.lower() != ".xml":
+        print(f"  Note: output '{out_path}' does not end in .xml (possible typo?) "
+              f"— writing there anyway.", file=sys.stderr)
 
     stem = input_path.stem
 
@@ -1732,6 +1941,29 @@ def main():
             cfg_path = match
         with open(cfg_path, encoding="utf-8-sig") as fh:
             cfg = json.load(fh)
+
+        # Two-way tier report: config tiers missing from the file, and file
+        # tiers the config doesn't map (whose content won't be exported).
+        cfg_tiers  = _config_tier_names(cfg)
+        file_tiers = set(tier_map.keys())
+        missing   = sorted(cfg_tiers - file_tiers)
+        unmapped  = sorted(file_tiers - cfg_tiers)
+        if missing:
+            print(f"\n  WARNING: {len(missing)} tier(s) referenced by the config are "
+                  f"absent from this file and will be empty: "
+                  f"{', '.join(missing)}", file=sys.stderr)
+        if unmapped:
+            print(f"  WARNING: {len(unmapped)} tier(s) in this file are not mapped "
+                  f"by the config and will not be exported: "
+                  f"{', '.join(unmapped)}\n", file=sys.stderr)
+
+        # A config usually supplies only the tier mapping; the document id and
+        # object language still belong to THIS file.  Offer the config's values
+        # as the Enter-default, but let the user change them.
+        cfg["text_id"] = _ask("Document identifier", stem)
+        cfg["object_lang"] = _ask(
+            "ISO 639-3 code of the object language  [XML: xml:lang='...']",
+            cfg.get("object_lang") or "")
     else:
         cfg = interactive_config(tier_map, annotations, stem)
 
@@ -1752,11 +1984,11 @@ def main():
     segments = build_segments(annotations, children, tier_map, cfg)
     nonempty = [s for s in segments if s["forms"]]
     if len(nonempty) < len(segments):
-        print(f"  Note: {len(segments) - len(nonempty)} segment(s) with no "
+        print(f"\n  Note: {len(segments) - len(nonempty)} segment(s) with no "
               f"transcription text skipped.")
     segments = nonempty
-    print(f"{len(segments)} unit(s) found. Writing {args.output} ...")
-    write_xml(segments, cfg, args.output)
+    print(f"{len(segments)} unit(s) found. Writing {out_path} ...")
+    write_xml(segments, cfg, str(out_path))
     print("Done.")
 
 
