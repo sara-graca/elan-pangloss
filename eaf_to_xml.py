@@ -24,16 +24,35 @@ Convert a whole directory with a saved configuration:
 
 Single-file output
 ------------------
-The second argument may be an .xml FILE name, or a FOLDER.  
-When it is a folder, the XML is written into it under the EAF's own
+The second argument may be an .xml FILE name, or a FOLDER (existing or created
+on demand).  When it is a folder, the XML is written into it under the EAF's own
 name with a .xml extension (input.eaf -> output_dir/input.xml).
 
 Config reuse for directories
 ----------------------------
---config can be a single JSON file (used for every file) or a FOLDER of configs.
-With a folder, each XML is matched to the config that can represent its content. 
-You confirm the proposed file->config mapping before converting. 
-Files no config fits are set up interactively; unused configs are ignored.
+--config may point to a single JSON file (one mapping applied to every file
+whose tiers match) OR to a FOLDER of configs.  When it is a folder, each EAF is
+matched to a config by TIER STRUCTURE — the converter picks the config whose
+referenced tiers all exist in that file (the most specific one when several
+fit), shows the proposed file->config mapping for you to confirm or adjust, and
+converts.  So one config can serve every file built from the same template,
+with extra configs for the multispeaker or wordlist variants.  Files with no
+compatible config are configured interactively (and saved into that folder);
+configs that match nothing are ignored.
+
+Interactive navigation
+-----------------------
+At most prompts you can type  <  (or "back") to return to the previous
+question if you made a mistake.  Press Enter to accept a suggestion on a
+*required* field, or to *skip* an optional field.  The final summary lists
+any tiers that will NOT be exported, so nothing is dropped silently — and
+when there are such tiers, you are offered to go back and adjust the mapping
+before saving.
+
+Config format
+-------------
+Configs are saved as JSON.  A config describes one or more speakers, each with
+their own tier mapping.
 """
 
 import sys
@@ -1184,7 +1203,7 @@ def _print_speaker_mapping(spk, indent="    "):
         print(f"{indent}{'Morph PoS':<13}: (none)")
 
 
-def _show_config_summary(cfg, tier_map=None):
+def _show_config_summary(cfg, tier_map):
     print()
     print("=" * 60)
     print("Summary")
@@ -1197,13 +1216,10 @@ def _show_config_summary(cfg, tier_map=None):
         label = f"Speaker {spk['who']}" if spk.get("who") else "Speaker"
         print(f"\n  {label}  (segment tier: {spk['segment_tier']})")
         _print_speaker_mapping(spk, indent="    ")
-    unmapped = []
-    if tier_map is not None:
-        unmapped = sorted(set(tier_map) - _config_tier_names(cfg))
-        if unmapped:
-            print(f"\n  Tiers NOT exported ({len(unmapped)}): "
-                  + ", ".join(unmapped))
-            print("  (their content will be absent from the XML)")
+    unmapped = sorted(set(tier_map) - _config_tier_names(cfg))
+    if unmapped:
+        print(f"\n  Tiers NOT exported ({len(unmapped)}): " + ", ".join(unmapped))
+        print("  (their content will be absent from the XML)")
     print()
     return unmapped
 
@@ -1489,7 +1505,7 @@ def write_xml(segments, cfg, out_path):
 
     used_ids = set()
     seq = 0
-    for i, s in enumerate(segments, 1):
+    for s in segments:
         raw = (s["id"] or "").strip()
         # Prefer the segment's own integer value as the id (S5 / W5); fall back
         # to a sequential number.  Guarantee uniqueness: a duplicate integer id
@@ -1851,10 +1867,8 @@ def _resolve_single_output(output_arg, input_path):
         a folder (created on demand), for convenience.
       - Otherwise it is treated as a file path and used as-is.
 
-    Returns the resolved output file Path.  Exits with an error only when the
-    argument is ambiguous in a way that would otherwise crash on write (e.g. an
-    existing directory passed where a file was clearly intended is fine — we use
-    it as a folder — but an existing *file* with no .xml extension is accepted).
+    Returns the resolved output file Path.  Folders are created on demand, so
+    the caller can always open the returned path for writing.
     """
     out = Path(output_arg)
     ends_with_sep = output_arg.endswith(("/", "\\"))
@@ -1866,11 +1880,6 @@ def _resolve_single_output(output_arg, input_path):
     )
 
     if is_folder:
-        out.mkdir(parents=True, exist_ok=True)
-        return out / (input_path.stem + ".xml")
-
-    # A plain file path: make sure it isn't secretly a directory.
-    if out.is_dir():  # unreachable given the branch above, kept for safety
         out.mkdir(parents=True, exist_ok=True)
         return out / (input_path.stem + ".xml")
 
@@ -1960,10 +1969,16 @@ def main():
         # A config usually supplies only the tier mapping; the document id and
         # object language still belong to THIS file.  Offer the config's values
         # as the Enter-default, but let the user change them.
-        cfg["text_id"] = _ask("Document identifier", stem)
-        cfg["object_lang"] = _ask(
-            "ISO 639-3 code of the object language  [XML: xml:lang='...']",
-            cfg.get("object_lang") or "")
+        # A config usually supplies only the tier mapping; the document id and
+        # object language still belong to THIS file.  Ask for each (Enter keeps
+        # the suggestion) — unless the CLI flag already answers it, which also
+        # lets the whole run stay non-interactive for scripting.
+        if not args.text_id:
+            cfg["text_id"] = _ask("Document identifier", stem)
+        if not args.lang:
+            cfg["object_lang"] = _ask(
+                "ISO 639-3 code of the object language  [XML: xml:lang='...']",
+                cfg.get("object_lang") or "")
     else:
         cfg = interactive_config(tier_map, annotations, stem)
 
@@ -1984,7 +1999,7 @@ def main():
     segments = build_segments(annotations, children, tier_map, cfg)
     nonempty = [s for s in segments if s["forms"]]
     if len(nonempty) < len(segments):
-        print(f"\n  Note: {len(segments) - len(nonempty)} segment(s) with no "
+        print(f"  Note: {len(segments) - len(nonempty)} segment(s) with no "
               f"transcription text skipped.")
     segments = nonempty
     print(f"{len(segments)} unit(s) found. Writing {out_path} ...")

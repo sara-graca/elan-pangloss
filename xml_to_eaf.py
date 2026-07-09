@@ -601,7 +601,7 @@ def _save_configs_per_file_interactive(configs):
     while True:
         folder = input(
             "\nSave configurations to reuse next time?\n"
-            "Enter a FOLDER name (created if needed) — one '<filename>.json' is\n"
+            "Enter a FOLDER name — one '<filename>.json' is\n"
             "saved per XML.  Press Enter to skip: "
         ).strip()
         if not folder:
@@ -710,7 +710,10 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
     if len(distinct) <= 1:
         groups = [("", distinct[0] if distinct else "", units)]
     else:
-
+        # The XML marks each unit with who="…"; ELAN has no per-annotation
+        # speaker attribute, so speakers are separated by giving each one its own
+        # set of tiers, every base name suffixed "@<speaker>" (announced during
+        # tier naming, see _show_predefined / _custom_cfg).
         groups = [(f"@{w}", w, [u for u in units if u["who"] == w]) for w in distinct]
         empties = [u for u in units if not u["who"]]
         if empties:
