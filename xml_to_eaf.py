@@ -71,6 +71,14 @@ _AUDIO_MIME = {"wav": "audio/x-wav", "mp3": "audio/mpeg", "flac": "audio/x-flac"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
+def _plural(n, singular, plural=None):
+    """
+    "1 file" / "3 files" — pick the right form for a count.  Irregulars pass the
+    plural explicitly (_plural(n, "entry", "entries")).
+    """
+    return f"{n} {singular if n == 1 else (plural or singular + 's')}"
+
+
 def sec_to_ms(s):
     try:
         return round(float(s) * 1000)
@@ -212,12 +220,6 @@ def _content_flags(units, is_wordlist):
                 has_m_gls=has_m_gls, speakers=speakers)
 
 
-def _structure_signature(is_wordlist, flags):
-    return (is_wordlist, tuple(flags["form_kinds"]), tuple(flags["transl_langs"]),
-            flags["has_notes"], flags["has_words"], flags["has_w_gls"],
-            flags["has_morphs"], flags["has_m_gls"], tuple(sorted(flags["speakers"])))
-
-
 # ─── Tier roles / linguistic types ───────────────────────────────────────────
 
 # The ELAN constraint each role's LINGUISTIC_TYPE must carry:
@@ -250,6 +252,8 @@ def _config_tiers_with_constraints(cfg, is_wordlist):
             out.append((cfg["morph_tier"], "Symbolic_Subdivision"))
             if cfg.get("morph_gls_tier"):
                 out.append((cfg["morph_gls_tier"], "Symbolic_Association"))
+            if cfg.get("morph_pos_tier"):
+                out.append((cfg["morph_pos_tier"], "Symbolic_Association"))
     else:
         if cfg.get("word_tier"):
             out.append((cfg["word_tier"], "Symbolic_Subdivision"))
@@ -259,6 +263,8 @@ def _config_tiers_with_constraints(cfg, is_wordlist):
                 out.append((cfg["morph_tier"], "Symbolic_Subdivision"))
                 if cfg.get("morph_gls_tier"):
                     out.append((cfg["morph_gls_tier"], "Symbolic_Association"))
+                if cfg.get("morph_pos_tier"):
+                    out.append((cfg["morph_pos_tier"], "Symbolic_Association"))
     # de-duplicate while keeping order (a tier name maps to one type)
     seen, uniq = set(), []
     for name, constraint in out:
@@ -269,9 +275,45 @@ def _config_tiers_with_constraints(cfg, is_wordlist):
     return uniq
 
 
+def _standard_type_for(cfg, tier_name):
+    """
+    The standard LINGUISTIC_TYPE for a tier: its own name, except where several
+    tiers are the same KIND of annotation and only differ by a label already
+    carried in the tier name.  One translation tier per language ('ft_fr',
+    'ft_bo', 'ft_en') are all free translations -> type 'ft'; a word gloss and a
+    morpheme gloss ('ge_mot', 'ge_mb') are both glosses -> type 'ge'.
+    """
+    if tier_name in (cfg.get("transl_tiers") or {}).values():
+        return "ft"
+    if tier_name in (cfg.get("word_gls_tier"), cfg.get("morph_gls_tier")):
+        return "ge"
+    return tier_name
+
+
 def _default_types(cfg, is_wordlist):
-    """Standard mapping: each tier's type == the tier name."""
-    return {name: name for name, _ in _config_tiers_with_constraints(cfg, is_wordlist)}
+    """Standard mapping: each tier's type == the tier name, except grouped kinds."""
+    return {name: _standard_type_for(cfg, name)
+            for name, _ in _config_tiers_with_constraints(cfg, is_wordlist)}
+
+
+def _split_pos(form, cfg):
+    """
+    Split a morpheme form that carries its part of speech inline, e.g.
+    'rwak:vi' with separator ':' -> ('rwak', 'vi').  This is the inverse
+    of eaf_to_xml's morph_pos_sep, which appends PoS to the morpheme form on the
+    way out.
+
+    Only the LAST separator splits, so a form containing the separator itself
+    ('a:b:n') keeps it in the form ('a:b') and takes 'n' as the PoS.  A form with
+    no separator has no PoS.  Returns (form, pos_or_empty).
+    """
+    sep = cfg.get("morph_pos_sep") or ""
+    if not cfg.get("morph_pos_tier") or not sep:
+        return form, ""
+    head, found, tail = form.rpartition(sep)
+    if not found or not head or not tail:
+        return form, ""      # no separator, or nothing on one side of it
+    return head, tail
 
 
 def _type_of(cfg, tier_name, is_wordlist):
@@ -336,31 +378,55 @@ def _form_label(kind, idx):
     return f"{role} ({kind or 'no kindOf'})"
 
 
-def _show_summary(cfg, is_wordlist=False):
+def _show_summary(cfg, is_wordlist=False, show_types=False,
+                  per_file_flags=None):
+    """
+    Print the chosen tier names.  With show_types, each tier is followed by the
+    LINGUISTIC_TYPE it will get — used after the types step, so the two can be
+    read side by side.  During tier naming the types are left out: they are
+    chosen afterwards, and only if the user asks to.
+    """
+    types = _default_types(cfg, is_wordlist) if show_types else {}
+    if show_types and cfg.get("types"):
+        types = cfg["types"]
+
+    rows = []      # (label, tier name, trailing note)
+    ref = cfg.get('ref_tier') or 'ref'
+    rows.append(("Segment/reference tier", ref, "(time-aligned)"))
+    for idx, fm in enumerate(cfg.get("forms") or []):
+        rows.append((_form_label(fm.get('kind', ''), idx), fm["tier"], ""))
+    for lang, tname in (cfg.get("transl_tiers") or {}).items():
+        rows.append((f"Translation ({lang if lang else '(no lang code)'})",
+                     tname, ""))
+    for key, label in (("notes_tier",     "Notes tier"),
+                       ("word_tier",      "Word tier"),
+                       ("word_gls_tier",  "Word gloss tier"),
+                       ("morph_tier",     "Morpheme tier"),
+                       ("morph_gls_tier", "Morpheme gloss tier")):
+        rows.append((label, cfg.get(key) or "(none)", ""))
+    if cfg.get("morph_pos_tier"):
+        rows.append(("Morpheme PoS tier", cfg["morph_pos_tier"],
+                     f"(split on {cfg.get('morph_pos_sep','')!r})"))
+
+    # Size the columns to what they hold, so the types line up when shown.
+    w_label = max(len(r[0]) for r in rows)
+    w_tier  = max(len(r[1]) for r in rows)
+
     print()
     print("=" * 60)
     print("Summary of your choices")
     print("=" * 60)
-    print(f"  Segment/reference tier         : {cfg.get('ref_tier') or 'ref'}"
-          f"  (time-aligned)")
-    for idx, fm in enumerate(cfg.get("forms") or []):
-        print(f"  {_form_label(fm.get('kind',''), idx):34s}: {fm['tier']}")
-    for lang, tname in (cfg.get("transl_tiers") or {}).items():
-        label = lang if lang else "(no lang code)"
-        print(f"  Translation ({label})                  : {tname}")
-    def opt(k): return cfg.get(k) or "(none)"
-    print(f"  Notes tier                      : {opt('notes_tier')}")
-    print(f"  Word tier                       : {opt('word_tier')}")
-    print(f"  Word gloss tier                 : {opt('word_gls_tier')}")
-    print(f"  Morpheme tier                   : {opt('morph_tier')}")
-    print(f"  Morpheme gloss tier             : {opt('morph_gls_tier')}")
-    if cfg.get("types"):
-        pairs = _config_tiers_with_constraints(cfg, is_wordlist)
-        renamed = ", ".join(f"{name} -> {_type_of(cfg, name, is_wordlist)}"
-                            for name, _ in pairs
-                            if _type_of(cfg, name, is_wordlist) != name)
-        print(f"  Linguistic types                : "
-              f"{renamed if renamed else 'same as tier names'}")
+    for label, tier, note in rows:
+        line = f"  {label:{w_label}} : {tier:{w_tier if show_types else 0}}"
+        if show_types and tier != "(none)":
+            line += f"  ->  type {types.get(tier, tier)}"
+        if note:
+            line += f"  {note}"
+        print(line.rstrip())
+    varies = _gls_varies_note(per_file_flags, is_wordlist, cfg)
+    if varies:
+        print()
+        print(varies)
     print()
 
 
@@ -375,43 +441,148 @@ def _predefined_cfg(is_wordlist, f):
     has_words = f["has_words"] and not is_wordlist
     both_gls = f["has_w_gls"] and f["has_m_gls"] and f["has_morphs"] and has_words
     morph_ok = f["has_morphs"] and (has_words or is_wordlist)
-    return {
+
+    cfg = {
         "ref_tier":       "ref",
         "forms":          forms,
         "transl_tiers":   transl_map,
         "notes_tier":     "notes" if f["has_notes"] else None,
-        "word_tier":      "word"  if has_words else None,
-        "word_gls_tier":  ("ge_w" if both_gls else "ge")
+        "word_tier":      "mot"   if has_words else None,
+        "word_gls_tier":  ("ge_mot" if both_gls else "ge")
                           if f["has_w_gls"] and has_words else None,
         "morph_tier":     "mb"    if morph_ok else None,
-        "morph_gls_tier": ("ge_m" if both_gls else "ge")
+        "morph_gls_tier": ("ge_mb" if both_gls else "ge")
                           if f["has_m_gls"] and morph_ok else None,
+        "morph_pos_tier": None,
+        "morph_pos_sep":  "",
+        # Names used by files of the group that carry only one kind of gloss;
+        # see _adjust_gls_names_for_file.
+        "word_gls_only_tier":  "ge",
+        "morph_gls_only_tier": "ge",
     }
+    # Tier names must be unique, but the type they share need not be: see
+    # _standard_type_for.
+    cfg["types"] = _default_types(cfg, is_wordlist)
+    return cfg
 
 
-def _speaker_suffix_note(f):
+def _speaker_suffix_note(f, per_file_flags=None):
     """
-    When the document has 2+ speakers, print (once, during tier naming) why each
-    tier name will be duplicated per speaker and suffixed "@<speaker>".  The
-    suffixes are the real who= codes from the XML, whatever they are.
+    When 2+ speakers occur, print (once, during tier naming) why each tier name
+    will be duplicated per speaker and suffixed "@<speaker>".  The suffixes are
+    the real who= codes from the XML, whatever they are.
+
+    In a folder run the flags are the UNION of a group's files, so the speakers
+    listed are every code seen anywhere in the group — not necessarily all in one
+    document, and each file only gets the tiers for ITS own speakers.  Say so
+    rather than claiming "this document has 3 speakers" of eleven files that have
+    two apiece.
     """
     spk = f.get("speakers") or []
     if len(spk) < 2:
         return
-    suffixes = ", ".join(f"@{w}" for w in spk)
-    print(f"NOTE: This document has {len(spk)} speakers ({', '.join(spk)}).")
-    print(f"      Every tier below is created once per speaker:")
-    print(f"      the names become {suffixes} versions "
-          f"(tx -> {', '.join('tx'+s for s in ('@'+w for w in spk))}).")
+    per_file = [set(pf.get("speakers") or []) for pf in per_file_flags or []]
+    group = len(per_file) > 1
+    varies = group and len({frozenset(s) for s in per_file}) > 1
+
+    if varies:
+        print(f"NOTE: {len(spk)} speakers occur across this group "
+              f"({', '.join(spk)}); no single")
+        print(f"      file need have them all.  Each tier below is created once "
+              f"per speaker,")
+        print(f"      for the speakers that file actually has: "
+              f"tx -> {', '.join('tx@'+w for w in spk[:2])}, …")
+    else:
+        what = "Every file in this group has" if group else "This document has"
+        print(f"NOTE: {what} {len(spk)} speakers ({', '.join(spk)}).")
+        print(f"      Every tier below is created once per speaker:")
+        print(f"      the names become {', '.join('@'+w for w in spk)} versions "
+              f"(tx -> {', '.join('tx@'+w for w in spk)}).")
     print()
 
 
-def _show_predefined(is_wordlist, f):
+def _gls_cases(per_file_flags, is_wordlist):
+    """
+    Which gloss combinations actually occur across the files of a group, as a set
+    of (has_word_gloss, has_morpheme_gloss) pairs, ignoring files with no gloss
+    at all.
+
+      (True, True)   some file has both  -> it needs the two names apart
+      (True, False)  some file has only a word gloss
+      (False, True)  some file has only a morpheme gloss
+
+    The interview shows ONE config for the group, built from the union of its
+    files, so these cases decide what has to be asked and what the display may
+    claim.
+    """
+    seen = set()
+    for f in per_file_flags or []:
+        has_words = f["has_words"] and not is_wordlist
+        morph_ok  = f["has_morphs"] and (has_words or is_wordlist)
+        pair = (bool(f["has_w_gls"] and has_words),
+                bool(f["has_m_gls"] and morph_ok))
+        if any(pair):
+            seen.add(pair)
+    return seen
+
+
+def _gls_varies(per_file_flags, is_wordlist):
+    """
+    Whether the gloss tier NAMES will differ between the files of a group.
+
+    The shown config is built from the UNION of the group's files, so the two
+    gloss tiers are named apart as soon as a word gloss and a morpheme gloss
+    appear anywhere in the group — even if no single file has both (one file
+    glosses words, another glosses morphemes).  Any file that then carries only
+    one of them uses a single name instead, so the shown names are right for some
+    files and not others.
+    """
+    cases = _gls_cases(per_file_flags, is_wordlist)
+    if not cases:
+        return False
+    union_w = any(w for w, _ in cases)
+    union_m = any(m for _, m in cases)
+    # Names are only apart when the union has both kinds; they then vary if any
+    # file lacks one of them.
+    return union_w and union_m and any(not (w and m) for w, m in cases)
+
+
+def _gls_varies_note(per_file_flags, is_wordlist, cfg=None):
+    """
+    The explanation shown wherever a group's gloss tier names are displayed, or
+    '' when every file in the group agrees.  Kept in one place so the tier-name
+    preview and the summary cannot describe the same group differently.  Spells
+    out each single-gloss case the group actually contains, with the name that
+    case will really get.
+    """
+    if not _gls_varies(per_file_flags, is_wordlist):
+        return ""
+    cases = _gls_cases(per_file_flags, is_wordlist)
+    cfg = cfg or {}
+    lines = []
+    if (True, True) in cases:
+        lines.append("  Only files having BOTH a word gloss and a morpheme "
+                     "gloss need the two apart.")
+    else:
+        lines.append("  The two names above are apart because the group as a "
+                     "whole glosses both;\n  no single file here has both.")
+    if (True, False) in cases:
+        lines.append(f"  Files with only a word gloss use "
+                     f"'{cfg.get('word_gls_only_tier') or 'ge'}'.")
+    if (False, True) in cases:
+        lines.append(f"  Files with only a morpheme gloss use "
+                     f"'{cfg.get('morph_gls_only_tier') or 'ge'}'.")
+    return "\n".join(lines)
+
+
+def _show_predefined(is_wordlist, f, per_file_flags=None):
     cfg = _predefined_cfg(is_wordlist, f)
+    varies = _gls_varies(per_file_flags, is_wordlist)
+    cases = _gls_cases(per_file_flags, is_wordlist)
     print()
     print("Standard tier names:")
     print()
-    _speaker_suffix_note(f)
+    _speaker_suffix_note(f, per_file_flags)
     print(f"  {cfg['ref_tier']:8s}  {'Utterance id':32s}  "
           f"[XML: <S id> / <W id>]  (time-aligned)")
     for idx, fm in enumerate(cfg["forms"]):
@@ -425,11 +596,43 @@ def _show_predefined(is_wordlist, f):
                            ("morph_tier", "Morpheme break", "<M><FORM>"),
                            ("morph_gls_tier", "Morpheme gloss", "<M><TRANSL>")):
         if cfg.get(key):
-            print(f"  {cfg[key]:8s}  {role:32s}  [XML: {xml}]")
+            note = ""
+            case = {"word_gls_tier":  (True, False),
+                    "morph_gls_tier": (False, True)}.get(key)
+            # Only mark the line when the group really contains files having
+            # just this one kind of gloss — otherwise the name never changes.
+            if varies and case in cases:
+                only = cfg.get(_GLS_ONLY_KEY[key]) or "ge"
+                which = "word" if key == "word_gls_tier" else "morpheme"
+                note = f"  <- '{only}' in files with only a {which} gloss"
+            print(f"  {cfg[key]:8s}  {role:32s}  [XML: {xml}]{note}")
+    if varies:
+        print()
+        print(_gls_varies_note(per_file_flags, is_wordlist, cfg))
     print()
 
 
-def _custom_cfg(is_wordlist, f):
+def _ask_morph_pos(cfg, is_wordlist):
+    """
+    Offer to split a part of speech out of the morpheme form.
+
+    eaf_to_xml can append a PoS to each morpheme form with a separator
+    ('rwak:vi'); this is the way back.  It cannot be auto-detected — a separator
+    character may be part of the form itself — so it is only done when asked for,
+    and the separator is given explicitly.
+    """
+    cfg["morph_pos_tier"] = None
+    cfg["morph_pos_sep"] = ""
+    if not cfg.get("morph_tier"):
+        return
+    if not _yesno("Do the morpheme forms carry a part of speech after a "
+                  "separator (e.g. 'rwak:vi')?", False):
+        return
+    cfg["morph_pos_sep"] = _ask("  Separator between morpheme and PoS", ":")
+    cfg["morph_pos_tier"] = _ask("  Part-of-speech tier name", "rx")
+
+
+def _custom_cfg(is_wordlist, f, per_file_flags=None):
     has_words = f["has_words"] and not is_wordlist
     while True:
         cfg = {"ref_tier": _ask("Segment/reference tier name (time-aligned)", "ref")}
@@ -447,69 +650,94 @@ def _custom_cfg(is_wordlist, f):
                 f"Translation tier name (language: {lang!r})" if lang
                 else "Translation tier name (no language code in XML)", default_name)
         cfg["notes_tier"] = _ask("Notes tier name", "notes") if f["has_notes"] else None
-        cfg["word_tier"]  = _ask("Word tier name", "word") if has_words else None
+        cfg["word_tier"]  = _ask("Word tier name", "mot") if has_words else None
         both_gls = f["has_w_gls"] and f["has_m_gls"] and f["has_morphs"] and cfg["word_tier"]
         cfg["word_gls_tier"] = (
-            _ask("Word gloss tier name", "ge_w" if both_gls else "ge")
+            _ask("Word gloss tier name", "ge_mot" if both_gls else "ge")
             if f["has_w_gls"] and cfg["word_tier"] else None)
         morph_ok = f["has_morphs"] and (cfg["word_tier"] or is_wordlist)
         cfg["morph_tier"] = _ask("Morpheme tier name", "mb") if morph_ok else None
         cfg["morph_gls_tier"] = (
-            _ask("Morpheme gloss tier name", "ge_m" if both_gls else "ge")
+            _ask("Morpheme gloss tier name", "ge_mb" if both_gls else "ge")
             if f["has_m_gls"] and cfg["morph_tier"] else None)
+        # The two names above are only needed by files having BOTH glosses.  A
+        # file with just one gloss can use a single name — and a word-only file
+        # and a morpheme-only file are different situations, so each is named
+        # separately, and only when the group actually contains that case.
+        cases = _gls_cases(per_file_flags, is_wordlist)
+        mixed = _gls_varies(per_file_flags, is_wordlist)
+        cfg["word_gls_only_tier"] = (
+            _ask("  Gloss tier name in files with only a WORD gloss", "ge")
+            if mixed and (True, False) in cases else None)
+        cfg["morph_gls_only_tier"] = (
+            _ask("  Gloss tier name in files with only a MORPHEME gloss", "ge")
+            if mixed and (False, True) in cases else None)
+        _ask_morph_pos(cfg, is_wordlist)
+        cfg["types"] = _default_types(cfg, is_wordlist)
 
-        _show_summary(cfg, is_wordlist)
+        _show_summary(cfg, is_wordlist, per_file_flags=per_file_flags)
         if _yesno("Does this look correct?", True):
             return cfg
         print("\nStarting over — please re-enter your choices.\n")
 
 
-def _show_predefined_types(cfg, is_wordlist):
+def _show_predefined_types(cfg, is_wordlist, per_file_flags=None):
     print()
-    print("Standard linguistic types (one per tier, named after the tier):")
+    print("Standard linguistic types (named after the tier, except where "
+          "several tiers")
+    print("share one kind of annotation — every 'ft_xx' is an 'ft', every "
+          "gloss a 'ge'):")
     print()
     label = {None: "time-aligned", "Symbolic_Association": "Symbolic_Association",
              "Symbolic_Subdivision": "Symbolic_Subdivision"}
+    types = _default_types(cfg, is_wordlist)
     for name, constraint in _config_tiers_with_constraints(cfg, is_wordlist):
-        print(f"  tier {name:12s}  ->  type {name:12s}  ({label[constraint]})")
+        print(f"  tier {name:12s}  ->  type {types[name]:12s}  "
+              f"({label[constraint]})")
     print()
 
 
-def _custom_types(cfg, is_wordlist):
+def _custom_types(cfg, is_wordlist, per_file_flags=None):
     """Let the user rename each linguistic type; constraints stay fixed by role."""
     pairs = _config_tiers_with_constraints(cfg, is_wordlist)
     while True:
         types = {}
+        standard = _default_types(cfg, is_wordlist)
         for name, _constraint in pairs:
-            types[name] = _ask(f"Type for tier '{name}'", name)
+            # Default to the STANDARD type, not the tier name: for 'ft_fr' that
+            # is 'ft', which is what pressing Enter should give.
+            types[name] = _ask(f"Type for tier '{name}'", standard[name])
         cfg["types"] = types
-        _show_summary(cfg, is_wordlist)
+        _show_summary(cfg, is_wordlist, show_types=True,
+                      per_file_flags=per_file_flags)
         if _yesno("Does this look correct?", True):
             return types
         print("\nStarting over — please re-enter the types.\n")
 
 
-def _choose_types(cfg, is_wordlist):
+def _choose_types(cfg, is_wordlist, per_file_flags=None):
     """Optional step: choose the LINGUISTIC_TYPE for the chosen tiers."""
     if not _yesno("\nDo you also want to choose the tier TYPES "
                   "(LINGUISTIC_TYPE)?", False):
         return  # leave cfg["types"] unset -> tier type == tier name
-    _show_predefined_types(cfg, is_wordlist)
+    _show_predefined_types(cfg, is_wordlist, per_file_flags)
     choice = input(
         "Use these standard types, or choose custom ones? "
         "[standard / custom]: ").strip().lower()
     if choice in ("s", "standard", ""):
         cfg["types"] = _default_types(cfg, is_wordlist)
-        _show_summary(cfg, is_wordlist)
+        _show_summary(cfg, is_wordlist, show_types=True,
+                      per_file_flags=per_file_flags)
         if _yesno("Does this look correct?", True):
             return
         print("\nSwitching to custom types.\n")
-    _custom_types(cfg, is_wordlist)
+    _custom_types(cfg, is_wordlist, per_file_flags)
 
 
-def interactive_config(is_wordlist, units, save=True, stem=None):
+def interactive_config(is_wordlist, units, save=True, stem=None,
+                       per_file_flags=None):
     f = _content_flags(units, is_wordlist)
-    _show_predefined(is_wordlist, f)
+    _show_predefined(is_wordlist, f, per_file_flags)
     choice = input(
         "Use these standard names, or choose custom names? [standard / custom]: "
     ).strip().lower()
@@ -517,7 +745,9 @@ def interactive_config(is_wordlist, units, save=True, stem=None):
     cfg = None
     if choice in ("s", "standard", ""):
         cfg = _predefined_cfg(is_wordlist, f)
-        _show_summary(cfg, is_wordlist)
+        _ask_morph_pos(cfg, is_wordlist)
+        cfg["types"] = _default_types(cfg, is_wordlist)
+        _show_summary(cfg, is_wordlist, per_file_flags=per_file_flags)
         if not _yesno("Does this look correct?", True):
             print("\nSwitching to custom names.\n")
             cfg = None
@@ -526,9 +756,9 @@ def interactive_config(is_wordlist, units, save=True, stem=None):
         print("Tier naming")
         print("=" * 60)
         print("Choose a name for each tier that will be created in the EAF.\n")
-        cfg = _custom_cfg(is_wordlist, f)
+        cfg = _custom_cfg(is_wordlist, f, per_file_flags)
 
-    _choose_types(cfg, is_wordlist)
+    _choose_types(cfg, is_wordlist, per_file_flags)
 
     if save:
         _save_config_interactive(cfg, stem)
@@ -593,7 +823,7 @@ def _save_configs_per_file(configs, folder):
         for path in paths:
             if _write_config(cfg, str(folder / (path.stem + ".json"))):
                 n += 1
-    print(f"Saved {n} config(s) to {folder}/")
+    print(f"Saved {_plural(n, 'config')} to {folder}/")
     return n
 
 
@@ -650,7 +880,8 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
 
     def collect(units_sub):
         b = {"ref": [], "form": defaultdict(list), "transl": defaultdict(list),
-             "notes": [], "word": [], "word_gls": [], "morph": [], "morph_gls": []}
+             "notes": [], "word": [], "word_gls": [], "morph": [], "morph_gls": [],
+             "morph_pos": []}
         for u in units_sub:
             ref_id = new_id()
             ref_val = (_form_text(u["forms"], primary.get("kind", ""))
@@ -690,9 +921,12 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
                 prev_m = None
                 for m in morphs:
                     mid = new_id()
-                    b["morph"].append((mid, parent_id, prev_m, m["form"])); prev_m = mid
+                    form, pos = _split_pos(m["form"], cfg)
+                    b["morph"].append((mid, parent_id, prev_m, form)); prev_m = mid
                     if cfg.get("morph_gls_tier") and m["gloss"]:
                         b["morph_gls"].append((new_id(), mid, None, m["gloss"]))
+                    if cfg.get("morph_pos_tier") and pos:
+                        b["morph_pos"].append((new_id(), mid, None, pos))
 
             if is_wordlist:
                 add_morphs(anchor, u["morphs"])
@@ -717,7 +951,8 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
         groups = [(f"@{w}", w, [u for u in units if u["who"] == w]) for w in distinct]
         empties = [u for u in units if not u["who"]]
         if empties:
-            print(f"  Note: {len(empties)} unit(s) have no who= and go on "
+            print(f"  Note: {_plural(len(empties), 'unit')} "
+              f"{'has' if len(empties) == 1 else 'have'} no who= and go on "
                   f"un-suffixed tiers alongside the per-speaker ones.",
                   file=sys.stderr)
             groups.append(("", "", empties))
@@ -825,6 +1060,9 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
                 if cfg.get("morph_gls_tier") and b["morph_gls"]:
                     write_ref(nm(cfg["morph_gls_tier"]), lt_of(cfg["morph_gls_tier"]),
                               nm(cfg["morph_tier"]), b["morph_gls"], participant=part)
+                if cfg.get("morph_pos_tier") and b["morph_pos"]:
+                    write_ref(nm(cfg["morph_pos_tier"]), lt_of(cfg["morph_pos_tier"]),
+                              nm(cfg["morph_tier"]), b["morph_pos"], participant=part)
         elif cfg.get("word_tier") and b["word"]:
             word_name = nm(cfg["word_tier"])
             write_ref(word_name, lt_of(cfg["word_tier"]), primary_tier, b["word"],
@@ -838,6 +1076,9 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
                 if cfg.get("morph_gls_tier") and b["morph_gls"]:
                     write_ref(nm(cfg["morph_gls_tier"]), lt_of(cfg["morph_gls_tier"]),
                               nm(cfg["morph_tier"]), b["morph_gls"], participant=part)
+                if cfg.get("morph_pos_tier") and b["morph_pos"]:
+                    write_ref(nm(cfg["morph_pos_tier"]), lt_of(cfg["morph_pos_tier"]),
+                              nm(cfg["morph_tier"]), b["morph_pos"], participant=part)
 
     # ── LINGUISTIC_TYPE block: one per distinct type actually used ────────────
     emitted = []
@@ -888,51 +1129,269 @@ def build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg):
 
 # ─── Directory mode ──────────────────────────────────────────────────────────
 
+_GLS_DISAMBIGUATED = {"word_gls_tier": "ge_mot", "morph_gls_tier": "ge_mb"}
+_GLS_KEYS  = tuple(_GLS_DISAMBIGUATED)
+_GLS_ONLY_KEY = {"word_gls_tier": "word_gls_only_tier",
+                 "morph_gls_tier": "morph_gls_only_tier"}
+_GLS_OTHER = {"word_gls_tier": "morph_gls_tier", "morph_gls_tier": "word_gls_tier"}
+
+
+def _adjust_gls_names_for_file(cfg, flags, is_wordlist):
+    """
+    A word gloss and a morpheme gloss cannot both be called 'ge' in one file, so
+    they get two names ('ge_mot' and 'ge_mb' by default) when a file has BOTH.
+    In a folder run the config is shared by a whole group, and the group's flags
+    are the union of its files: a file carrying only ONE kind of gloss would
+    inherit the two-name scheme from a groupmate that has both.  Such a file uses
+    the single name configured for its own case — 'word_gls_only_tier' or
+    'morph_gls_only_tier' — so a word-only file and a morpheme-only file can be
+    named differently.  Without those keys (an older config, or a group that
+    never needed them) the names are left as they are.
+    """
+    has_words = flags["has_words"] and not is_wordlist
+    morph_ok  = flags["has_morphs"] and (has_words or is_wordlist)
+    w_gls = flags["has_w_gls"] and has_words
+    m_gls = flags["has_m_gls"] and morph_ok
+    if w_gls and m_gls:
+        return cfg                      # both present: the distinction is needed
+    out = dict(cfg)
+    # A file that lacks one kind of gloss should not carry the group's name for
+    # it: build_eaf skips the tier for want of content, but the config would
+    # still claim a tier the file never has.
+    if not w_gls:
+        out["word_gls_tier"] = None
+    if not m_gls:
+        out["morph_gls_tier"] = None
+    if w_gls:
+        key, single = "word_gls_tier", cfg.get("word_gls_only_tier")
+    elif m_gls:
+        key, single = "morph_gls_tier", cfg.get("morph_gls_only_tier")
+    else:
+        return out                      # no gloss at all: nothing to rename
+    old = cfg.get(key)
+    if not single or not old or old == single:
+        return out
+    out[key] = single
+    # The types map keys on tier names, so move the renamed tier's entry.  Every
+    # OTHER type is left exactly as it is: it may have been chosen by hand, and
+    # re-deriving the whole map here would silently throw those choices away.
+    types = out.get("types")
+    if types:
+        out["types"] = {(single if n == old else n): t for n, t in types.items()}
+    return out
+
+
 def _convert_one(path, cfg, output_dir):
     text_id, object_lang, is_wordlist, soundfile, units = parse_xml(str(path))
+    cfg = _adjust_gls_names_for_file(
+        cfg, _content_flags(units, is_wordlist), is_wordlist)
     eaf = build_eaf(text_id, object_lang, is_wordlist, soundfile, units, cfg)
     out_path = Path(output_dir) / (path.stem + ".eaf")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(eaf)
     kind = "words" if is_wordlist else "sentences"
     print(f"  {path.name} -> {out_path.name}  ({len(units)} {kind})")
 
 
+def _shapes_compatible(a_wl, a_flags, b_wl, b_flags):
+    """
+    Whether two files belong in one interactive group, mirroring eaf_to_xml's
+    folder behaviour: files of the same corpus that differ only in OPTIONAL
+    content — which speakers occur, whether notes / words / morphemes / glosses
+    happen to be present — share one interview.  What must genuinely agree is
+    the document type and the labelled content that maps to differently-NAMED
+    tiers: FORM kinds and translation languages (comparable as sets, one side
+    allowed to have extras — a file without translations still belongs with its
+    translated siblings).  A single union config covers every member, because
+    build_eaf only writes a configured tier when a file has content for it.
+    """
+    if a_wl != b_wl:
+        return False
+    ak, bk = set(a_flags["form_kinds"]), set(b_flags["form_kinds"])
+    al, bl = set(a_flags["transl_langs"]), set(b_flags["transl_langs"])
+    return (ak <= bk or bk <= ak) and (al <= bl or bl <= al)
+
+
 def _group_xmls(xml_paths):
-    groups = {}
+    """
+    Parse all XMLs and group them for the interactive interview.
+
+    Files whose content shapes are compatible (see _shapes_compatible) share one
+    group and one interview: speaker sets and optional content (notes, words,
+    morphemes, glosses) never split a group, so a corpus mixing one- and
+    two-speaker recordings, some with notes and some without, is configured
+    once.  Each group's representative is the CONCATENATION of its files' units,
+    so the interview sees the union of every form kind, translation language and
+    content flag present anywhere in the group.
+
+    Returns list of (is_wordlist, units, [paths]) sorted by group size desc.
+    """
+    parsed = []
     for path in xml_paths:
         try:
             _, _, is_wordlist, _, units = parse_xml(str(path))
         except Exception as e:
             print(f"Warning: could not parse {path.name}: {e}", file=sys.stderr)
             continue
-        sig = _structure_signature(is_wordlist, _content_flags(units, is_wordlist))
-        if sig not in groups:
-            groups[sig] = (is_wordlist, units, [])
-        groups[sig][2].append(path)
-    return sorted(groups.values(), key=lambda g: len(g[2]), reverse=True)
+        parsed.append((path, is_wordlist, units,
+                       _content_flags(units, is_wordlist)))
+
+    groups = []   # each: {"members": [idx, ...]}
+    for i, (_, wl, _, flags) in enumerate(parsed):
+        hits = [g for g in groups
+                if any(_shapes_compatible(wl, flags,
+                                          parsed[j][1], parsed[j][3])
+                       for j in g["members"])]
+        if not hits:
+            groups.append({"members": [i]})
+        else:
+            first = hits[0]
+            first["members"].append(i)
+            for extra in hits[1:]:
+                first["members"].extend(extra["members"])
+                groups.remove(extra)
+
+    result = []
+    for g in groups:
+        members = g["members"]
+        is_wordlist = parsed[members[0]][1]
+        units = [u for j in members for u in parsed[j][2]]
+        paths = [parsed[j][0] for j in members]
+        # Keep each member's own flags: the interview shows one config for the
+        # group, but some tier names depend on what an INDIVIDUAL file has.
+        per_file = [parsed[j][3] for j in members]
+        result.append((is_wordlist, units, paths, per_file))
+    return sorted(result, key=lambda g: len(g[2]), reverse=True)
+
+
+class _Interrupted(Exception):
+    """
+    Raised when the user presses Ctrl-C during a folder interview, carrying the
+    shapes answered so far so the caller can offer to keep that work rather than
+    lose it.
+    """
+    def __init__(self, configs):
+        super().__init__("interrupted")
+        self.configs = configs
+
+
+def _finish_configs(configs, output_dir, config_dir=None):
+    """
+    Convert every file of every answered shape, then offer to save configs.
+    Shared by the normal end of a folder run and the Ctrl-C path, so an
+    interrupted run saves exactly what a completed one would.
+    """
+    n_files = sum(len(paths) for _, paths in configs)
+    print(f"\nConverting {_plural(n_files, 'file')}...")
+    for cfg, paths in configs:
+        for path in paths:
+            _convert_one(path, cfg, output_dir)
+    if config_dir is not None:
+        _save_configs_per_file(configs, config_dir)
+    else:
+        _save_configs_per_file_interactive(configs)
+
+
+def _offer_partial_save(exc, output_dir, config_dir=None):
+    """
+    Handle a Ctrl-C out of the folder interview: offer to convert the shapes
+    already answered (and save their configs), or discard them.  The shape in
+    progress when Ctrl-C arrived is not among them — it was never finished.
+
+    A second Ctrl-C at this prompt quits immediately, so the interrupt always has
+    a way out.
+    """
+    configs = exc.configs
+    print()   # the ^C lands mid-line
+    if not configs:
+        print("Interrupted — no shape was fully answered, nothing to save.",
+              file=sys.stderr)
+        return
+    n_files = sum(len(paths) for _, paths in configs)
+    print(f"Interrupted after answering {_plural(len(configs), 'shape')} "
+          f"({_plural(n_files, 'file')}).")
+    try:
+        if not _yesno("Convert and save those files before quitting?", True):
+            print("Nothing saved.")
+            return
+    except (KeyboardInterrupt, EOFError):
+        print("\nNothing saved.")
+        return
+    try:
+        _finish_configs(configs, output_dir, config_dir)
+    except (KeyboardInterrupt, EOFError):
+        print("\nStopped; some files may not have been written.",
+              file=sys.stderr)
 
 
 def _interactive_configs(xml_paths):
+    """
+    Group XMLs by content shape and run the interview once per group.
+
+    Shapes are navigable: after each one you may go back to the previous shape
+    and answer it again.  Ctrl-C raises _Interrupted carrying whatever shapes are
+    already answered, so a long folder run can be abandoned part-way without
+    losing that work.
+    """
     groups = _group_xmls(xml_paths)
-    configs = []
+    if not groups:
+        print("None of the XML files could be parsed — nothing to configure.",
+              file=sys.stderr)
+        return []
     multi = len(groups) > 1
     if multi:
-        print(f"\nFound {len(groups)} different content shape(s) across "
-              f"{len(xml_paths)} file(s).")
-    for i, (is_wordlist, units, paths) in enumerate(groups, 1):
+        print(f"\nFound {_plural(len(groups), 'content shape')} across "
+              f"{_plural(len(xml_paths), 'file')} (speakers and optional "
+              f"content merged).")
+        print("Press Ctrl-C at any point to stop; you will be asked whether to "
+              "keep the shapes you have already answered.")
+
+    done = [None] * len(groups)
+
+    def answered():
+        return [(cfg, groups[j][2]) for j, cfg in enumerate(done)
+                if cfg is not None]
+
+    i = 0
+    while i < len(groups):
+        is_wordlist, units, paths, per_file = groups[i]
         if multi:
             names = ", ".join(p.name for p in paths[:4])
             if len(paths) > 4:
                 names += f" … (+{len(paths)-4} more)"
             print(f"\n{'='*64}")
-            print(f"Shape {i} — {len(paths)} file(s): {names}")
+            print(f"Shape {i+1} of {len(groups)} — "
+                  f"{_plural(len(paths), 'file')}: {names}")
+            if done[i] is not None:
+                print("(already configured — your answers are replaced by what "
+                      "you choose now)")
             print(f"{'='*64}")
         else:
-            print(f"All {len(paths)} file(s) share the same content shape.\n")
-        cfg = interactive_config(is_wordlist, units, save=False)
-        configs.append((cfg, paths))
-    return configs
+            print(f"All {_plural(len(paths), 'file')} share one content shape "
+                  f"(speakers and optional content merged).\n")
+        try:
+            done[i] = interactive_config(is_wordlist, units, save=False,
+                                         per_file_flags=per_file)
+        except KeyboardInterrupt:
+            # Hand back what is already answered; the caller decides what to do
+            # with it.  The shape being answered when Ctrl-C arrived is
+            # incomplete and is not included.
+            raise _Interrupted(answered()) from None
+
+        # Shape-level navigation.  The interview itself has no per-question back
+        # (a wrong answer is fixed by declining its summary, which restarts it),
+        # so this is offered between shapes.
+        if multi and i > 0:
+            try:
+                if _yesno(f"Go back to shape {i} and answer it again?", False):
+                    i -= 1
+                    continue
+            except KeyboardInterrupt:
+                raise _Interrupted(answered()) from None
+        i += 1
+
+    return answered()
 
 
 def _load_folder_configs(config_dir):
@@ -1089,24 +1548,27 @@ def _convert_with_config_folder(xml_paths, output_dir, config_dir):
             xml_paths, mapping, unmatched, folder_configs)
 
     if mapping:
-        print(f"\nConverting {len(mapping)} matched file(s)...")
+        print(f"\nConverting {_plural(len(mapping), 'matched file')}...")
         for path in xml_paths:
             if path in mapping:
                 _convert_one(path, mapping[path][1], output_dir)
 
     if unmatched:
-        print(f"\n{len(unmatched)} file(s) have no matching config in the folder:")
+        print(f"\n{_plural(len(unmatched), 'file')} "
+              f"{'has' if len(unmatched) == 1 else 'have'} no matching config "
+              f"in the folder:")
         for path in unmatched:
             print(f"  {path.name}")
         if _yesno("Configure these by hand? (n = skip them)", False):
-            new_configs = _interactive_configs(unmatched)
-            _save_configs_per_file(new_configs, config_dir)
-            print(f"\nConverting {len(unmatched)} newly-configured file(s)...")
-            for cfg, paths in new_configs:
-                for path in paths:
-                    _convert_one(path, cfg, output_dir)
+            try:
+                new_configs = _interactive_configs(unmatched)
+            except _Interrupted as e:
+                # save any new configs into the same folder, as a full run would
+                _offer_partial_save(e, output_dir, config_dir)
+                return
+            _finish_configs(new_configs, output_dir, config_dir)
         else:
-            print(f"Skipping {len(unmatched)} unmatched file(s).")
+            print(f"Skipping {_plural(len(unmatched), 'unmatched file')}.")
 
 
 def process_directory(xml_dir, output_dir, config=None):
@@ -1143,7 +1605,8 @@ def process_directory(xml_dir, output_dir, config=None):
                                 is_wordlist, path.name)
                 skipped.append(path)
         if skipped:
-            print(f"\n{len(skipped)} file(s) don't match the config "
+            print(f"\n{_plural(len(skipped), 'file')} "
+                  f"{'does not' if len(skipped) == 1 else 'do not'} match the config "
                   f"'{cfg_path.name}':")
             for path in skipped:
                 print(f"  {path.name}")
@@ -1151,27 +1614,29 @@ def process_directory(xml_dir, output_dir, config=None):
         else:
             hand = False
 
-        print(f"\nConverting {len(to_process)} file(s) with '{cfg_path.name}'...")
+        print(f"\nConverting {_plural(len(to_process), 'file')} "
+              f"with '{cfg_path.name}'...")
         for path in to_process:
             _convert_one(path, cfg, output_dir)
 
         if hand:
-            print(f"\nConfiguring {len(skipped)} remaining file(s) by hand "
+            print(f"\nConfiguring {_plural(len(skipped), 'remaining file')} by hand "
                   f"(grouped by content shape)...")
-            extra = _interactive_configs(skipped)
-            _save_configs_per_file_interactive(extra)
-            for extra_cfg, paths in extra:
-                for path in paths:
-                    _convert_one(path, extra_cfg, output_dir)
+            try:
+                extra = _interactive_configs(skipped)
+            except _Interrupted as e:
+                _offer_partial_save(e, output_dir)
+                return
+            _finish_configs(extra, output_dir)
         return
 
-    print(f"Scanning {len(xml_paths)} XML file(s)...")
-    configs = _interactive_configs(xml_paths)
-    _save_configs_per_file_interactive(configs)
-    print(f"\nConverting {sum(len(p) for _, p in configs)} file(s)...")
-    for cfg, paths in configs:
-        for path in paths:
-            _convert_one(path, cfg, output_dir)
+    print(f"Scanning {_plural(len(xml_paths), 'XML file')}...")
+    try:
+        configs = _interactive_configs(xml_paths)
+    except _Interrupted as e:
+        _offer_partial_save(e, output_dir)
+        return
+    _finish_configs(configs, output_dir)
 
 
 # ─── Single-file output resolution ───────────────────────────────────────────
@@ -1273,4 +1738,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl-C outside the folder interview (single-file mode, or while
+        # converting): stop quietly rather than with a traceback.  The folder
+        # interview catches its own and offers to save first.
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)
