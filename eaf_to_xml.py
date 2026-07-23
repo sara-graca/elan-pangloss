@@ -9,11 +9,11 @@ Inspect tier structure:
 
 Convert a single file (interactive):
     python eaf_to_xml.py input.eaf output.xml
-    python eaf_to_xml.py input.eaf output_dir/
+    python eaf_to_xml.py input.eaf output_dir/                      # -> output_dir/input.xml
 
 Convert a single file with a saved configuration:
     python eaf_to_xml.py input.eaf output.xml --config my.json
-    python eaf_to_xml.py input.eaf output_dir/ --config my.json
+    python eaf_to_xml.py input.eaf output_dir/ --config my.json     # -> output_dir/input.xml
 
 Convert a whole directory (interactive):
     python eaf_to_xml.py input_dir/ output_dir/
@@ -22,37 +22,23 @@ Convert a whole directory with a saved configuration:
     python eaf_to_xml.py input_dir/ output_dir/ --config my.json
     python eaf_to_xml.py input_dir/ output_dir/ --config configs_folder/
 
-Single-file output
-------------------
-The second argument may be an .xml FILE name, or a FOLDER (existing or created
-on demand).  When it is a folder, the XML is written into it under the EAF's own
-name with a .xml extension (input.eaf -> output_dir/input.xml).
 
 Config reuse for directories
 ----------------------------
---config may point to a single JSON file (one mapping applied to every file
-whose tiers match) OR to a FOLDER of configs.  When it is a folder, each EAF is
-matched to a config by TIER STRUCTURE — the converter picks the config whose
-referenced tiers all exist in that file (the most specific one when several
-fit), shows the proposed file->config mapping for you to confirm or adjust, and
-converts.  So one config can serve every file built from the same template,
-with extra configs for the multispeaker or wordlist variants.  Files with no
-compatible config are configured interactively (and saved into that folder);
-configs that match nothing are ignored.
+--config may point to a single JSON file OR to a FOLDER of configs.  
+When it is a folder, each EAF is matched to a config by TIER STRUCTURE — 
+the converter picks the config whose referenced tiers all exist in that file 
+(the most specific one when several fit), shows the proposed file->config 
+mapping for you to confirm or adjust, and converts.  So one config can serve 
+every file built from the same template.  Files with no compatible config 
+are configured interactively; configs that match nothing are ignored.
 
 Interactive navigation
 -----------------------
 At most prompts you can type  <  (or "back") to return to the previous
-question if you made a mistake.  Press Enter to accept a suggestion on a
-*required* field, or to *skip* an optional field.  The final summary lists
-any tiers that will NOT be exported, so nothing is dropped silently — and
-when there are such tiers, you are offered to go back and adjust the mapping
-before saving.
-
-Config format
--------------
-Configs are saved as JSON.  A config describes one or more speakers, each with
-their own tier mapping.
+question.  Press Enter to *skip* an optional field, "y" to accept a suggestion.
+The final summary lists any tiers that will NOT be exported, and when there 
+are such tiers, you are offered to go back and adjust the mapping before saving.
 """
 
 import sys
@@ -153,7 +139,8 @@ def parse_eaf(path):
 def build_children(annotations, tier_map, linguistic_types):
     """
     Build a children index:  parent_ann_id → [child_ann_ids, ordered].
-    Handles both Symbolic (ref-based) and Time_Subdivision (time-based) children.
+    Handles Symbolic (ref-based) children and both time-based stereotypes
+    (Time_Subdivision and Included_In), which are matched by containment.
     """
     children = {}
 
@@ -170,12 +157,9 @@ def build_children(annotations, tier_map, linguistic_types):
         if not parent_tier:
             continue
         ltype = tier.get("LINGUISTIC_TYPE_REF", "")
-        if linguistic_types.get(ltype, {}).get("CONSTRAINTS") == "Time_Subdivision":
+        if linguistic_types.get(ltype, {}).get("CONSTRAINTS") in (
+                "Time_Subdivision", "Included_In"):
             time_sub_tiers[tid] = parent_tier
-
-    # Note: only Symbolic (ref-based) and Time_Subdivision children are linked.
-    # The rarer ELAN "Included_In" stereotype is not handled — such children
-    # would be left unlinked.  No interlinear corpus in scope uses it.
 
     if time_sub_tiers:
         time_anns_by_tier = defaultdict(list)
@@ -266,23 +250,14 @@ def collect_descendants(ann_id, target_tier_id, children, annotations):
 
 # ─── Speaker identification ───────────────────────────────────────────────────
 
-_SPEAKER_SUFFIX_RE = re.compile(r"@([\w-]+)$")
+_SPEAKER_SUFFIX_RE = re.compile(r"@\s*(\S.*?)?\s*$")
 
 
 def _speaker_key(tid, tier_map):
     """
     Explicit speaker marker for a tier, or '' if none:
       1. PARTICIPANT attribute
-      2. trailing  @SPx  suffix   (e.g. ref@SP2 -> "SP2", tx@SP -> "SP")
-
-    The suffix may contain hyphens (tx@SP1-cp -> "SP1-cp") and need not look
-    like "SPn" at all (tx@marie -> "marie"): anything after the last '@' is the
-    speaker code.
-
-    A leading name fragment like 'A_' is deliberately NOT treated as a speaker:
-    in these corpora it's a FLEx text/export prefix, not a participant, so it
-    must not invent a who="A".  Real multiple speakers always appear as distinct
-    @SPx suffixes (or PARTICIPANT values).
+      2. everything after @   (e.g. ref@SP2 -> "SP2", tx@marie -> "marie")
     """
     t = tier_map.get(tid)
     if t is None:
@@ -291,16 +266,14 @@ def _speaker_key(tid, tier_map):
     if part:
         return part.strip()
     m = _SPEAKER_SUFFIX_RE.search(tid or "")
-    return m.group(1) if m else ""
+    # A bare trailing '@' (e.g. 'id@') carries no speaker: the group is empty.
+    return (m.group(1) or "") if m else ""
 
 
 def _base_tier(tid):
     """
     The tier name with any trailing '@<speaker>' discriminator removed, e.g.
     'tx@SP1' -> 'tx', 'ref@A' -> 'ref', 'tx@SP1-cp' -> 'tx', 'word' -> 'word'.
-    Used to compare and merge tier structures across files that differ only by
-    speaker code, so one interactive answer against base names can serve every
-    file in a folder.
     """
     return _SPEAKER_SUFFIX_RE.sub("", tid or "")
 
@@ -314,7 +287,8 @@ def _file_speaker_codes(tier_map):
     seen = []
     for tid in tier_map:
         m = _SPEAKER_SUFFIX_RE.search(tid or "")
-        if m and m.group(1) not in seen:
+        # A bare trailing '@' yields no code; it must not become a "speaker".
+        if m and m.group(1) and m.group(1) not in seen:
             seen.append(m.group(1))
     return seen
 
@@ -349,6 +323,28 @@ def media_basenames(path):
 
 # ─── Tier inspection ──────────────────────────────────────────────────────────
 
+# How many speaker codes to list in the tier tree's 'who' column before
+# summarising the rest as '+N more'.
+_WHO_MAX = 4
+
+# Same idea for the 'tiers:' line listing the real tier names behind a merged
+# node: a corpus-wide tier can stand for dozens of them.
+_TIERS_MAX = 6
+
+
+def _norm_tier_name(name):
+    """
+    A tier name with incidental whitespace around its '@' removed, so that
+    'tx@ mohi' and 'tx@mohi' compare equal.  Used only for display decisions —
+    the real names are never rewritten.
+    """
+    m = _SPEAKER_SUFFIX_RE.search(name or "")
+    if not m:
+        return name or ""
+    # 'id@' normalises to 'id'
+    return f"{_base_tier(name)}@{m.group(1)}" if m.group(1) else _base_tier(name)
+
+
 def print_tier_tree(tier_map, annotations):
     ann_count = defaultdict(int)
     for ann in annotations.values():
@@ -373,8 +369,7 @@ def print_tier_tree(tier_map, annotations):
 
         # In a MERGED (folder) view a node stands for several real tiers and the
         # files may disagree about its type or language; show every distinct
-        # value rather than one file's as if it were everyone's.  Real ELAN tiers
-        # carry none of these keys, so single-file mode is unaffected.
+        # value rather than one file's as if it were everyone's.
         types    = tier.get("_types")
         langs    = tier.get("_langs")
         spk      = tier.get("_speakers")
@@ -385,21 +380,32 @@ def print_tier_tree(tier_map, annotations):
         if langs is not None and len(langs) > 1:
             lang = "|".join(langs)
         if spk:
-            who = ",".join(spk)
+            if len(spk) > _WHO_MAX:
+                shown = ",".join(spk[:_WHO_MAX])
+                who = f"{shown},+{len(spk) - _WHO_MAX} more"
+            else:
+                who = ",".join(spk)
 
         # The real tier names are usually just '<base>@<who>' — that is already
         # readable from the name and the who column, so listing them would be
-        # noise.  Print them only when they DON'T follow from it (e.g. correction
-        # copies 'tx@SP1-cp' whose PARTICIPANT still says 'SP1', or a tier with
-        # no speaker suffix sitting beside suffixed ones).
+        # noise.  Print them when they DON'T follow from it 
         extra = None
         if variants:
             base     = tier.get("_base") or tid
-            expected = {f"{base}@{w}" for w in (spk or [])}
-            # A lone tier named exactly like the node adds nothing either: its
-            # speaker comes from PARTICIPANT rather than a name suffix.
-            if set(variants) not in (expected, {base}):
-                extra = f"{prefix}     tiers: " + ", ".join(variants)
+            norm      = {_norm_tier_name(v) for v in variants}
+            expected  = {f"{base}@{w}" if w else base for w in (spk or [])}
+            expected.add(base)
+            if not norm <= expected:
+                # Deviating names come FIRST
+                odd     = [v for v in variants if _norm_tier_name(v) not in expected]
+                regular = [v for v in variants if _norm_tier_name(v) in expected]
+                ordered = odd + regular
+                if len(ordered) > _TIERS_MAX:
+                    body = (", ".join(ordered[:_TIERS_MAX])
+                            + f", +{len(ordered) - _TIERS_MAX} more")
+                else:
+                    body = ", ".join(ordered)
+                extra = f"{prefix}     tiers: " + body
         return {
             "name":  f"{prefix}+- {label!r}",
             "type":  f"type={ltype!r}",
@@ -409,10 +415,6 @@ def print_tier_tree(tier_map, annotations):
             "extra": extra,
         }
 
-    # Walk once to collect every line, so each column can be sized to what it
-    # actually holds instead of a fixed width padded for the worst case.  The
-    # name cell includes its indent, which keeps deeper nodes from pushing the
-    # later columns out of alignment.
     rows = []
 
     def collect(tid, prefix=""):
@@ -454,14 +456,12 @@ def detect_segment_tiers(tier_map, annotations):
 
     Strategy:
       1. Candidates: time-aligned root tiers with at least one annotation AND
-         at least one child tier (standalone annotation tracks have 0 children).
+         at least one child tier.
       2. Group by speaker (PARTICIPANT, then @SPx suffix).
       3. Within each speaker group, keep only the candidate with the most
          child tiers — that is almost always the main segment tier.
 
-    Assumption: at most ONE segment tier per speaker (the richest is kept).  A
-    file that legitimately has two parallel root tiers for the same speaker
-    would need them picked manually.
+    Assumption: at most ONE segment tier per speaker (the richest is kept).
     """
     child_tier_count = defaultdict(int)
     for tier in tier_map.values():
@@ -724,17 +724,10 @@ def _run_flow(build_steps, state, history=None, resume=False, escape_back=False)
 
 # ─── Role detection: LINGUISTIC_TYPE + name "contains" + structure ─────────────
 #
-# Tier *names* vary wildly between annotators (syllabique / mots / gloses, or
-# A_morph-gls-en, or phono / mot / morph).  What is stable is the
-# LINGUISTIC_TYPE (ref, tx, mot, mb, ge, ps/rx, ft, …) and the parent/child
-# structure.  So each role is matched as a substring against
+# Tier *names* vary between annotators. So each role is matched as a substring against
 # "<tier name> <linguistic type>" AND constrained structurally (descendant of a
 # given tier, or direct child of it).  These are only *suggestions*; the user
 # always confirms or overrides.
-#
-# Short tokens like "ge", "rx", "ps", "mb", "tx" are not typos: they are real
-# FLEx/CorpAfroAs LINGUISTIC_TYPE abbreviations (gloss, PoS, morpheme, …) and
-# are matched against the type string, not just the visible tier name.
 
 _POS = {
     "tx":   ("tx", "txt", "transcr", "phono", "syllab", "ortho"),
@@ -883,20 +876,31 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
         seg = s["segment_tier"]
         tx_default = _best_tier(tier_ids, tier_map, ann_count, "tx",
                                 under=seg, include_under=True)
-        tx = _pick_one(
-            "Transcription tier  [XML: <FORM>]",
-            tier_ids, required=True, default=tx_default, allow_back=True
+        # Select all transcription tiers at once (as with translations); the
+        # first one chosen is the primary form.  At least one is required.
+        chosen = _pick_many(
+            "Transcription tier(s)  [XML: <FORM>]",
+            tier_ids, allow_back=True,
+            defaults=[tx_default] if tx_default else (),
+            required=True,
         )
-        kind = _ask("  Transcription type (e.g. phono, ortho, or Enter for none)  "
-                    "[XML: <FORM kindOf='...'>]", "", allow_back=True)
-        forms = [{"tier": tx, "kind": kind or None}]
-        while _yesno("Add another transcription line?", False, allow_back=True):
-            ft = _pick_one("  Transcription tier  [XML: <FORM>]", tier_ids, allow_back=True)
-            if not ft:
+        # Each form may carry a kindOf label.  A label names the tier on the way
+        # back (xml_to_eaf), and two unlabelled forms would be indistinguishable
+        # there, so at most one form may be left unlabelled — the primary.
+        while True:
+            forms = []
+            for ttid in chosen:
+                kind = _ask(f"  Transcription type for '{_tier_label(ttid)}' "
+                            "(e.g. phono, ortho, or Enter for none)  "
+                            "[XML: <FORM kindOf='...'>]", "", allow_back=True)
+                forms.append({"tier": ttid, "kind": kind or None})
+            unlabelled = [f for f in forms if not f["kind"]]
+            if len(unlabelled) <= 1:
                 break
-            fk = _ask("  Transcription type (e.g. phono, ortho, or Enter for none)  "
-                      "[XML: <FORM kindOf='...'>]", "", allow_back=True)
-            forms.append({"tier": ft, "kind": fk or None})
+            print(f"  Only one transcription may be left unlabelled "
+                  f"(you left {len(unlabelled)}).  A plain <FORM> cannot be "
+                  f"told from another on the way back to ELAN — please give a "
+                  f"label to all but one.")
         s["forms"] = forms
 
     @_skip_if_prefilled
@@ -929,10 +933,6 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
     def step_notes(state):
         s = _spk(state)
         seg = s["segment_tier"]
-        # Auto-detect note tiers: names/types that look like a comment ('notes',
-        # 'Notes', 'comm', 'remark') sitting under this speaker's segment tier —
-        # excluding the free translation and the gloss tiers.  A bare 'not' tier
-        # is deliberately NOT suggested: in these corpora it is not a note tier.
         _N_POS = ("note", "comm", "remark", "observ")
         _N_NEG = ("notation", "ft", "trad", "transl", "morph", "mb", "gls",
                   "gloss", "segnum")
@@ -1022,7 +1022,7 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
         if not s.get("morph_form"):
             return _NOASK
         s["morph_pos"] = _pick_one(
-            "OPTIONAL — Part-of-speech tier (will be appended to each morpheme form)",
+            "OPTIONAL — Part-of-speech tier (will be appended to each morpheme gloss)",
             tier_ids,
             default=_best_tier(tier_ids, tier_map, ann_count, "pos",
                                under=s["morph_form"]),
@@ -1038,7 +1038,7 @@ def _make_speaker_steps(idx, tier_ids, tier_map, tier_set, multi, ann_count, is_
             s.setdefault("morph_pos_sep", "")
             return _NOASK
         s["morph_pos_sep"] = _ask(
-            "  Separator between morpheme and PoS (e.g.  :  or  _)", ":",
+            "  Separator between gloss and PoS (e.g.  :  or  _)", ":",
             allow_back=True
         )
 
@@ -1078,6 +1078,20 @@ def _derive_transform(a, b):
     """
     if not a or not b or a == b:
         return None
+
+    ma, mb = _SPEAKER_SUFFIX_RE.search(a), _SPEAKER_SUFFIX_RE.search(b)
+    code_a = (ma.group(1) or "") if ma else ""
+    code_b = (mb.group(1) or "") if mb else ""
+    if code_a and code_b and _base_tier(a) == _base_tier(b):
+        # Same base tier, different speaker code: swap the code, leaving every
+        # other part of the name untouched.
+        def f_code(name):
+            m = _SPEAKER_SUFFIX_RE.search(name or "")
+            if m and (m.group(1) or "") == code_a:
+                return f"{_base_tier(name)}@{code_b}"
+            return name   # shared tiers (no code, or another speaker's) as-is
+        return f_code
+
     p = _common_prefix_len(a, b)
     s = _common_prefix_len(a[::-1], b[::-1])
     s = min(s, len(a) - p, len(b) - p)
@@ -1511,18 +1525,22 @@ def build_segments(annotations, children, tier_map, cfg):
         for mid in collect_descendants(parent_id, mtid, children, annotations):
             m_val = annotations[mid]["value"].strip().strip("-=")
 
-            if pos_tid:
-                for pid in collect_descendants(mid, pos_tid, children, annotations):
-                    pv = annotations[pid]["value"].strip()
-                    if pv:
-                        m_val = m_val + pos_sep + pv
-                        break
-
             gloss = ""
             if gtid:
                 for gid in collect_descendants(mid, gtid, children, annotations):
                     if annotations[gid]["value"]:
                         gloss = annotations[gid]["value"].strip().strip("-=")
+                        break
+
+            # Pangloss has no element for a part of speech, so it rides on the
+            # morpheme GLOSS after a chosen separator ('go:vi').  Where the
+            # morpheme has no gloss there is nothing to separate it from, so the
+            # PoS stands alone rather than emitting a leading separator (':vi').
+            if pos_tid:
+                for pid in collect_descendants(mid, pos_tid, children, annotations):
+                    pv = annotations[pid]["value"].strip()
+                    if pv:
+                        gloss = (gloss + pos_sep + pv) if gloss else pv
                         break
 
             morphs.append({"form": m_val, "gloss": gloss, "gloss_lang": gls_lang})
@@ -1658,11 +1676,16 @@ def write_xml(segments, cfg, out_path):
     seq = 0
     for s in segments:
         raw = (s["id"] or "").strip()
-        # Prefer the segment's own integer value as the id (S5 / W5); fall back
-        # to a sequential number.  Guarantee uniqueness: a duplicate integer id
-        # (e.g. two speakers whose segnum both restart at 1) drops to the next
-        # free sequential id, since Pangloss requires ids unique per document.
-        unit_id = f"{unit_tag}{raw}" if raw.isdigit() else ""
+        # The segment tier's own value is the document's identifier for that
+        # unit, so it is carried across.  A bare number is the one
+        # value that cannot stand alone, so it takes the unit tag. 
+        if raw.isdigit():
+            unit_id = f"{unit_tag}{raw}"
+        else:
+            unit_id = raw
+        # Uniqueness is required per document: two speakers whose numbering both
+        # restart at 1, or a source with repeated identifiers, drop to the next
+        # free sequential id rather than emitting a duplicate.
         if not unit_id or unit_id in used_ids:
             seq += 1
             unit_id = f"{unit_tag}{seq}"
@@ -1688,8 +1711,6 @@ def write_xml(segments, cfg, out_path):
             lines.append(f'        <NOTE message="{_esc_attr(note)}"/>')
 
         if is_wordlist:
-            # A <W> entry may contain only <M> morphemes, never a nested <W>.
-            # The entry's own transcription/gloss are the FORM/TRANSL above.
             for w in s["words"]:
                 for m in w["morphs"]:
                     lines.append("        <M>")
@@ -1765,10 +1786,7 @@ def _base_path(tm, tid, memo=None):
     base path matches — comparing only the immediate parent's base name is not
     enough, because a child of a root-level copy 'tx@X-cp' and a child of the
     real 'tx' under 'ref' would then look identical and get re-parented onto
-    whichever 'tx' node happened to win the plain name.  A dangling PARENT_REF
-    (pointing at a tier the file does not define) is treated as that base name
-    at root, so a slightly corrupt file still renders instead of recursing into
-    a KeyError.
+    whichever 'tx' node happened to win the plain name.
     """
     if memo is None:
         memo = {}
@@ -1791,23 +1809,6 @@ def _representative_tier_map(tier_maps):
     """
     Build ONE base-name tier_map covering every tier seen in any file of the
     group (union), for the merged folder interview.
-
-    Tiers merge on their full BASE PATH (base name plus the base names of every
-    ancestor) — not on base name alone.  Two tiers that share a name but sit at
-    different places are genuinely different tiers ('tx@SP1' under 'ref@SP1' vs
-    a root-level copy 'tx@SP1-cp'), and merging them would draw a tree that no
-    real file has and pool their annotation counts; the same holds one level
-    down for their children.  When a base name occurs at several places, each
-    place gets its own node: the dominant one keeps the plain base name and the
-    others are labelled '(root)' or '(under <parent>)', so every real tier stays
-    visible and the shape stays true to the files.
-
-    Files may also legitimately disagree about a tier's linguistic type or
-    language (the same 'ref' can be lang='fr' in one file and 'en' in another).
-    Rather than silently showing one file's value as if it were everyone's, every
-    distinct value is recorded under '_types'/'_langs', the speaker codes under
-    '_speakers', and the real tier names behind the node under '_variants'.  The
-    tier tree displays these so the user sees the real spread before choosing.
     """
     # Collect per base path so tiers at different places never merge.
     candidates = defaultdict(list)         # path -> [(tid, tier), ...]
@@ -1829,15 +1830,6 @@ def _representative_tier_map(tier_maps):
                 if val and val not in store[path]:
                     store[path].append(val)
 
-    # A base name used at more than one place needs distinct dict KEYS: the tier
-    # map and the child index are both keyed by name, so two nodes called 'tx'
-    # would collide and a child could not say which parent it meant.  The
-    # dominant occurrence (most real tiers behind it, ties broken by having a
-    # parent) keeps the bare name so the spine reads naturally: other tiers
-    # reference their parent by base name, so the real 'tx' must own 'tx' or
-    # 'mot' would re-parent onto a stray root-level copy.  The odd ones out get a
-    # visible suffix — they appear in menus and summaries, so the label has to
-    # mean something to the reader and be typable.
     paths_of = defaultdict(list)           # base -> [(path, occurrences)]
     for path, occ in candidates.items():
         paths_of[path[0]].append((path, len(occ)))
@@ -1860,9 +1852,6 @@ def _representative_tier_map(tier_maps):
         else:
             key = (f"{base} (root)" if parent_path is None
                    else f"{base} (under {parent_path[0]})")
-            # A real tier could, in principle, be literally named like a
-            # generated key; keys are dict entries, so a clash would silently
-            # drop one of the two.  Suffix until free.
             taken = all_bases | set(key_of.values())
             while key in taken:
                 key += "'"
@@ -1874,9 +1863,6 @@ def _representative_tier_map(tier_maps):
         base, parent_path = path
         name = node_key(path)
         pick = occ[0][1]
-        # The parent is referenced by ITS key: a parent whose base name was
-        # disambiguated must still be reachable from its children.  A dangling
-        # PARENT_REF yields a path that is not itself a node — render as root.
         parent_name = (node_key(parent_path)
                        if parent_path in candidates else None)
         attrs = {
@@ -1905,18 +1891,6 @@ def _representative_annotations(annotation_samples, tier_maps, rep_map):
     Merge per-file annotation samples into one sample keyed to the MERGED node
     names, so annotation counts and segment auto-detection see every node that
     exists in at least one file.
-
-    Annotations are attributed using the same full base-path identity the merged
-    tier map uses, so a tier and a same-named tier elsewhere in the tree (e.g.
-    'tx@SP1' under 'ref@SP1' vs the root-level copy 'tx@SP1-cp' — or their
-    children) keep their counts apart instead of being pooled into one inflated
-    number.
-
-    Per node we keep the annotations of the file that has the most of them,
-    counting all speakers of that file together (a two-speaker file's 'tx@SP1'
-    and 'tx@SP2' both count towards 'tx').  Annotation IDs are re-keyed per file,
-    because ELAN IDs ('a1', 'a2', …) restart in every document and would
-    otherwise collide and drop annotations when the samples are merged.
     """
     name_of_path = {rep.get("_path"): name for name, rep in rep_map.items()}
 
@@ -1949,57 +1923,42 @@ def _representative_annotations(annotation_samples, tier_maps, rep_map):
 
 def _base_spine(tier_map):
     """
-    The structural backbone of a file in BASE names: every base tier that some
-    other tier hangs off (i.e. appears as a PARENT_REF).  Leaf tiers — glosses,
-    notes, alternative translations — are the OPTIONAL extras that legitimately
-    vary between files of the same corpus, so they are excluded here.  Two files
-    are treated as the same corpus when they share this backbone (see
-    _same_corpus), letting optional-tier and speaker-count variants merge.
+    The structural backbone of a file: every tier that some other tier hangs off
+    (i.e. appears as a PARENT_REF), identified by its full BASE PATH rather than
+    its bare name.  Leaf tiers — glosses, notes, alternative translations — are
+    the OPTIONAL extras that legitimately vary between files of the same corpus,
+    so they are excluded here.
     """
     spine = set()
+    memo = {}
+    by_base = {}
+    for tid in tier_map:
+        by_base.setdefault(_base_tier(tid), tid)
     for tier in tier_map.values():
         p = tier.get("PARENT_REF")
-        if p:
-            spine.add(_base_tier(p))
+        if not p:
+            continue
+        ref = p if p in tier_map else by_base.get(_base_tier(p))
+        spine.add(_base_path(tier_map, ref, memo) if ref
+                  else (_base_tier(p), None))
     return spine
 
 
 def _same_corpus(a_tiers, a_spine, b_tiers, b_spine):
     """
     Whether two files belong in one interactive group: the smaller file's
-    structural spine must be fully contained in the other file's base tiers
-    (in either direction).  This merges files that differ only by which optional
-    tiers are present or by how deep an optional branch goes, while keeping files
-    with genuinely different backbones apart.
-
-    A FLAT file (no parent-child tiers at all) has an EMPTY spine, and the empty
-    set is a subset of everything — which would fuse it with any group it meets.
-    Flat files carry no structural signal, so they only group with files having
-    the same base tier set.
+    structural spine must be fully contained in the other file's spine (in
+    either direction).  Flat files carry no structural signal, so they 
+    only group with files having the same base tier set.
     """
     if not a_spine or not b_spine:
         return a_tiers == b_tiers
-    return a_spine <= b_tiers or b_spine <= a_tiers
+    return a_spine <= b_spine or b_spine <= a_spine
 
 
 def _group_eafs(eaf_paths):
     """
     Parse all EAFs and group them for the interactive interview.
-
-    Files are grouped so that variants differing only by speaker '@' codes or by
-    which OPTIONAL (leaf) tiers are present share one group and one interview.
-    Grouping is by shared structural spine (see _same_corpus), computed on BASE
-    tier names.  Files with genuinely different backbones stay in separate
-    groups.
-
-    Each group yields a MERGED representative view: a tier_map and annotation
-    sample built from the UNION of every file's tiers (rebased to base names),
-    so the interview shows every tier any file has.  The interview is answered
-    once against those base names; per-file expansion (mapping base roles onto
-    each file's real '@speaker' tiers, and omitting roles whose tier is absent
-    from a given file) happens later, at convert time.
-
-    Returns list of (tier_map, annotations_sample, [paths]) sorted by size desc.
     """
     parsed = []   # (path, tier_map, annotations, base_tiers, spine)
     for path in eaf_paths:
@@ -2012,9 +1971,6 @@ def _group_eafs(eaf_paths):
         parsed.append((path, tier_map, annotations, base_tiers,
                        _base_spine(tier_map)))
 
-    # Union-find over the _same_corpus predicate.  Each file joins the first
-    # existing group any of whose members it matches; groups are merged when a
-    # file bridges two of them.
     groups = []   # each: {"members": [idx,...], "tiers": set, "spine": set}
     for i, (_, _, _, tiers, spine) in enumerate(parsed):
         hits = [g for g in groups
@@ -2051,8 +2007,7 @@ def _soundfile_for(path):
     """
     Pick the <SOUNDFILE> value for one EAF: the single linked audio file's
     basename.  With zero or several audio files, return None (empty HEADER) —
-    and on several, warn, because there is no reliable way to know which one is
-    the right recording (e.g. a stray second media left over from a template).
+    and on several, warn.
     """
     media = media_basenames(str(path))
     if len(media) == 1:
@@ -2184,11 +2139,6 @@ def _expand_config_for_file(cfg, tier_map):
         for base_spk in base_speakers:
             spk = _expand_speaker(base_spk, "", present)
             if spk:
-                # No '@' suffixes does not mean no speaker: ELAN's other way of
-                # recording one is the PARTICIPANT attribute (e.g. an EAF
-                # regenerated by xml_to_eaf from a single-speaker XML).  Take
-                # who from the segment tier so the attribution survives a
-                # round trip instead of silently dropping to "".
                 spk["who"] = (spk.get("who")
                               or _speaker_key(spk["segment_tier"], tier_map))
                 new_speakers.append(spk)
@@ -2211,9 +2161,6 @@ def _convert_one(path, cfg, output_dir):
     was_template = bool(cfg.get("_base_names"))
     cfg = _expand_config_for_file(cfg, tier_map)
     if was_template and not cfg.get("speakers"):
-        # The chosen segment tier does not exist in this file under any speaker
-        # code, so nothing can be built.  Say which file and why, and write no
-        # empty XML that would mask the problem in a batch run.
         print(f"  {path.name}: SKIPPED — its tiers do not include the chosen "
               f"segment tier (file left unconverted)", file=sys.stderr)
         return
@@ -2247,14 +2194,6 @@ def _interactive_configs(eaf_paths, dir_stem):
     variants unioned) and run the interview once per group, against a merged
     representative view.  The resulting config is a base-name template that is
     expanded per file at convert time.  Returns a list of (cfg, [paths]).
-
-    Structures are navigable like questions: '<' at the FIRST question of a
-    structure returns to the previous one, whose answers are shown again for
-    editing.  There is no extra prompt between structures — the same key that
-    steps back through questions steps back across structures.
-
-    Ctrl-C raises _Interrupted carrying whatever structures are already answered,
-    so a long folder run can be abandoned part-way without losing that work.
     """
     groups = _group_eafs(eaf_paths)
     if not groups:
@@ -2313,14 +2252,8 @@ def _interactive_configs(eaf_paths, dir_stem):
             i -= 1
             continue
         except KeyboardInterrupt:
-            # Hand back what is already answered; the caller decides what to do
-            # with it.  The structure being answered when Ctrl-C arrived is
-            # incomplete and is not included.
             raise _Interrupted(answered()) from None
         cfg["_base_names"] = True   # expanded per file in _expand_config_for_file
-        # The merged view may disambiguate a repeated base name into a display
-        # node ('tx (root)'); the config must carry the REAL base name so that
-        # per-file expansion can resolve it against actual tiers.
         node_to_base = {name: rep.get("_base") or name
                         for name, rep in tier_map.items()}
         done[i] = _rename_config_tiers(cfg, node_to_base)
@@ -2620,10 +2553,6 @@ def main():
     parser.add_argument("--config", metavar="PATH",
                         help="A JSON config file, or (for a directory) a FOLDER of "
                              "configs matched to each EAF by tier structure")
-    parser.add_argument("--lang",    metavar="CODE",
-                        help="Object language ISO code (overrides config)")
-    parser.add_argument("--text-id", metavar="ID",
-                        help="Value for id='...' (overrides config, single file only)")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -2645,10 +2574,6 @@ def main():
     if not args.output:
         parser.error("output file or folder is required unless --inspect is given")
 
-    # Resolve the output path up front — BEFORE the interview — so an
-    # ambiguous target (e.g. a folder passed where a file was expected) is
-    # turned into "<folder>/<eaf stem>.xml" or reported now, never after the
-    # user has answered every prompt.
     out_path = _resolve_single_output(args.output, input_path)
     if out_path.suffix.lower() != ".xml":
         print(f"  Note: output '{out_path}' does not end in .xml (possible typo?) "
@@ -2659,12 +2584,26 @@ def main():
     if args.config:
         cfg_path = Path(args.config)
         if cfg_path.is_dir():
-            # In single-file mode, accept a folder by matching '<stem>.json'.
             match = cfg_path / (stem + ".json")
-            if not match.exists():
-                print(f"No config '{match.name}' found in {cfg_path}", file=sys.stderr)
-                sys.exit(1)
-            cfg_path = match
+            if match.exists():
+                cfg_path = match
+            else:
+                folder_configs = _load_folder_configs(cfg_path)
+                tiers = set(tier_map.keys())
+                compatible = [(n, c, req) for (n, c, req) in folder_configs
+                              if req and req <= tiers]
+                compatible.sort(key=lambda t: -len(t[2]))
+                if not compatible:
+                    print(f"No config '{match.name}' in {cfg_path}, and none of "
+                          f"its configs fit this file's tiers.", file=sys.stderr)
+                    sys.exit(1)
+                best_name, best_cfg, _ = compatible[0]
+                print(f"No config '{match.name}' in {cfg_path}.")
+                if not _yesno(f"Use '{best_name}.json', which fits this file's "
+                              f"structure?", True):
+                    print("Nothing converted.", file=sys.stderr)
+                    sys.exit(1)
+                cfg_path = cfg_path / (best_name + ".json")
         with open(cfg_path, encoding="utf-8-sig") as fh:
             cfg = json.load(fh)
 
@@ -2683,26 +2622,13 @@ def main():
                   f"by the config and will not be exported: "
                   f"{', '.join(unmapped)}\n", file=sys.stderr)
 
-        # A config usually supplies only the tier mapping; the document id and
-        # object language still belong to THIS file.  Offer the config's values
-        # as the Enter-default, but let the user change them.
-        # A config usually supplies only the tier mapping; the document id and
-        # object language still belong to THIS file.  Ask for each (Enter keeps
-        # the suggestion) — unless the CLI flag already answers it, which also
-        # lets the whole run stay non-interactive for scripting.
-        if not args.text_id:
-            cfg["text_id"] = _ask("Document identifier", stem)
-        if not args.lang:
-            cfg["object_lang"] = _ask(
-                "ISO 639-3 code of the object language  [XML: xml:lang='...']",
-                cfg.get("object_lang") or "")
+        cfg["text_id"] = None
+        if not cfg.get("object_lang"):
+            print(f"Error: config '{cfg_path}' has no 'object_lang'.",
+                  file=sys.stderr)
+            sys.exit(1)
     else:
         cfg = interactive_config(tier_map, annotations, stem)
-
-    if args.lang:
-        cfg["object_lang"] = args.lang
-    if args.text_id:
-        cfg["text_id"] = args.text_id
 
     if not cfg.get("text_id"):
         cfg["text_id"] = stem
@@ -2728,8 +2654,5 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        # Ctrl-C outside the folder interview (single-file mode, or while
-        # converting): stop quietly rather than with a traceback.  The folder
-        # interview catches its own and offers to save first.
         print("\nInterrupted.", file=sys.stderr)
         sys.exit(130)
