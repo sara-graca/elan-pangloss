@@ -38,9 +38,15 @@ you choose to configure them by hand or skip them:
 python eaf_to_xml.py input_dir/ output_dir/ --config configs_folder/
 ```
 
-During the interview: type `<` to go back, press Enter to accept a suggested
-tier or skip an optional one. The final summary lists any tiers that won't
-be exported and lets you go back to map them.
+`--config` also accepts a folder in single-file mode: the script looks for
+`<input name>.json`, and failing that offers the config whose structure fits
+the file.
+
+During the interview: type `<` to go back, `y` to accept a suggestion, and
+Enter to skip an optional tier. Where several tiers can be chosen at once
+(transcriptions, translations, notes), give their numbers separated by commas.
+The final summary lists any tiers that won't be exported and lets you go back
+to map them.
 
 ## What's mapped
 
@@ -52,6 +58,9 @@ A few things to know:
 - `xml_to_eaf` rebuilds a reference-rooted EAF (time-aligned reference tier,
   transcriptions beneath it, words then morphemes under that); multi-speaker
   XML is split onto `@SP1`/`@SP2` tiers.
+- Pangloss has no element for a part of speech, so `eaf_to_xml` appends a PoS
+  tier to the morpheme gloss with a chosen separator (`deceive:v`);
+  `xml_to_eaf` can split it back out into its own tier.
 - Morpheme boundary markers (`-`, `=`) are stripped from morpheme forms/glosses.
 - Layers with no XML counterpart aren't stored in the XML; the
   "tiers not exported" summary shows what those are.
@@ -61,13 +70,3 @@ A few things to know:
 Plain JSON, editable by hand. `eaf_to_xml` configs describe one or more speakers
 and their tier mapping; `xml_to_eaf` configs name the ELAN tiers to create
 (`@SP1`/`@SP2` suffixes are added automatically).
-
-## Command line
-
-```
-eaf_to_xml.py INPUT [OUTPUT] [--inspect] [--config PATH] [--lang CODE] [--text-id ID]
-xml_to_eaf.py INPUT [OUTPUT] [--inspect] [--config PATH]
-```
-
-`INPUT`/`OUTPUT` are files or directories; `--config` is a JSON file or a folder
-of them; `--inspect` prints the structure and exits.
