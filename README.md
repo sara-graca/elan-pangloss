@@ -31,26 +31,14 @@ you choose to configure them by hand or skip them:
 ```bash
 python eaf_to_xml.py input_dir/ output_dir/ --config configs_folder/
 ```
-<<<<<<< HEAD
 `--config` also accepts a folder in single-file mode: the script looks for
 `<input name>.json`, and failing that offers the config whose structure fits
 the file.
-=======
-
-`--config` also accepts a folder in single-file mode: the script looks for
-`<input name>.json`, and failing that offers the config whose structure fits
-the file.
-
->>>>>>> 42c605177ceff9fd1968f516cfe3b8a9b5d51eef
 During the interview: type `<` to go back, `y` to accept a suggestion, and
 Enter to skip an optional tier. Where several tiers can be chosen at once
 (transcriptions, translations, notes), give their numbers separated by commas.
 The final summary lists any tiers that won't be exported and lets you go back
 to map them.
-<<<<<<< HEAD
-=======
-
->>>>>>> 42c605177ceff9fd1968f516cfe3b8a9b5d51eef
 ## What's mapped
 The interlinear content: sentence/reference units, transcription lines,
 translations, notes, words, morphemes, and glosses.
@@ -68,7 +56,6 @@ A few things to know:
 Plain JSON, editable by hand. `eaf_to_xml` configs describe one or more speakers
 and their tier mapping; `xml_to_eaf` configs name the ELAN tiers to create
 (`@SP1`/`@SP2` suffixes are added automatically).
-<<<<<<< HEAD
 
 ## Uniformizing tiers
 > **Note:** this script is newer and less thoroughly tested than the
@@ -103,5 +90,3 @@ stereotypes triggers a warning) and **tier names** (group base names and give
 each group one name). Speaker suffixes like `mot@SP1` are understood — you group
 the base names and the speaker part is reattached automatically
 (`mot@SP1` → `word@SP1`).
-=======
->>>>>>> 42c605177ceff9fd1968f516cfe3b8a9b5d51eef
